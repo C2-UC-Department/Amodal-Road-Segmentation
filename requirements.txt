@@ -1,0 +1,14 @@
+# Core numerical / image IO
+numpy>=1.26,<2.1
+pillow>=10.0
+opencv-python>=4.9
+scipy>=1.11
+tqdm>=4.66
+requests>=2.31
+
+# Deep learning (Mask2Former via HuggingFace). On Apple Silicon these wheels
+# ship with MPS (Metal) support out of the box.
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40
+accelerate>=0.29
