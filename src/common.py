@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -145,3 +146,78 @@ def overlay_mask(rgb: np.ndarray, mask: np.ndarray, color, alpha: float) -> np.n
     color = np.asarray(color, dtype=np.float32)
     out[m] = (1.0 - alpha) * out[m] + alpha * color
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# --------------------------------------------------------------------------- #
+# Occlusion geometry (shared by training-hint generation, the annotator, and
+# inference-time compositing in predict.py)
+# --------------------------------------------------------------------------- #
+def dilate(mask: np.ndarray, px: int) -> np.ndarray:
+    if px <= 0:
+        return mask
+    k = 2 * px + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
+
+
+def occluder_blob_mask(occluders: np.ndarray, visible: np.ndarray,
+                       near_px: int) -> np.ndarray:
+    """Whole connected components of `occluders` that touch the near-road band.
+
+    A per-pixel distance test (plain `occluders & dilate(visible, near_px)`)
+    only admits the slice of an occluder within `near_px` of the visible
+    road -- for a vehicle, that's roughly the tire/undercarriage band, since
+    the roof can be 100+ px further away. That silently discards the rest of
+    the vehicle's footprint regardless of how well a downstream model (e.g.
+    OFRSNet) reconstructs the road under the whole thing.
+
+    Here, instead, any connected blob of `occluders` that touches the near-road
+    band at all is admitted IN FULL: the eligibility test is per-object, not
+    per-pixel, which is what "this vehicle is occluding some of the road"
+    actually means.
+    """
+    road_neigh = dilate(visible, near_px)
+    n_labels, labels = cv2.connectedComponents(occluders.astype(np.uint8), connectivity=8)
+    result = np.zeros_like(occluders, dtype=bool)
+    for label in range(1, n_labels):  # 0 = background
+        comp = labels == label
+        if (comp & road_neigh).any():
+            result |= comp
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Resolution handling for OFRSNet (fully convolutional -- no fixed input size
+# is required; see config.OFRS_MAX_SIDE / OFRS_NET_STRIDE)
+# --------------------------------------------------------------------------- #
+def fit_within_max_side(labels: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
+    """Uniformly downscale (never up) so the longer side is <= max_side.
+
+    Unlike resizing to a fixed target shape, this scales BOTH axes by the same
+    factor, so aspect ratio is exactly preserved -- it only exists to bound
+    compute on very large images. Returns (labels, scale) so the caller can
+    invert it; scale == 1.0 means no resize happened.
+    """
+    h, w = labels.shape[:2]
+    scale = min(1.0, max_side / max(h, w))
+    if scale >= 1.0:
+        return labels, 1.0
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    resized = cv2.resize(labels.astype(np.uint8), (new_w, new_h),
+                         interpolation=cv2.INTER_NEAREST)
+    return resized, scale
+
+
+def pad_to_multiple(arr: np.ndarray, multiple: int, pad_value) -> np.ndarray:
+    """Pad a 2D (H, W[, ...]) array at the bottom/right up to a multiple of
+    `multiple` in H and W. The original content always stays the top-left
+    [0:h, 0:w] corner, so callers can invert this with a plain crop.
+    """
+    h, w = arr.shape[:2]
+    pad_h = (-h) % multiple
+    pad_w = (-w) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return arr
+    pad_width = [(0, pad_h), (0, pad_w)] + [(0, 0)] * (arr.ndim - 2)
+    return np.pad(arr, pad_width, mode="constant", constant_values=pad_value)

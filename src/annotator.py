@@ -61,7 +61,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
 from src import common  # noqa: E402
-from src.s4_build_incomplete import dilate  # noqa: E402  (footage occlusion hint)
 
 WINDOW = "amodal-road-annotator"
 MAX_CANVAS_W, MAX_CANVAS_H = 1280, 760
@@ -156,8 +155,8 @@ class Annotator:
                 print(f"[warn] no semantic map for {s.base}; "
                       "run `python -m src.s6_prepare_footage` first")
                 self.visible = np.zeros((h, w), bool)
-            self.occlusion = self.foreground & dilate(self.visible,
-                                                      config.ROAD_NEIGHBOURHOOD_PX)
+            self.occlusion = common.occluder_blob_mask(self.foreground, self.visible,
+                                                       config.ROAD_NEIGHBOURHOOD_PX)
 
         amodal_path = config.AMODAL_DIR / f"{s.base}.png"
         if amodal_path.exists():

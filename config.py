@@ -132,8 +132,20 @@ OFRS_CLASS_KEYWORDS = [
     ("vegetation",    ["vegetation", "terrain"],                                  []),
 ]
 
-# OFRSNet input/target spatial size (paper uses 384x1248). H, W.
-OFRS_INPUT_SIZE = (384, 1248)
+# OFRSNet is fully convolutional (global context uses adaptive pooling; every
+# up-sampling stage explicitly targets its skip connection's own shape), so it
+# accepts ANY input resolution/aspect ratio -- no fixed canvas is required.
+# We only:
+#   1. cap the longer side to OFRS_MAX_SIDE (uniform scale, aspect PRESERVED --
+#      unlike the old fixed-(384,1248) resize, this never stretches/squashes),
+#      purely to bound compute on very large photos;
+#   2. pad up to a multiple of OFRS_NET_STRIDE so the /8 down/up-sampling
+#      inside the network lines up exactly, then crop the padding back off.
+# This replaces the previous behaviour of forcing every image into a fixed
+# 384x1248 landscape canvas, which silently stretched/squashed any image
+# whose native aspect ratio differed (e.g. portrait phone photos).
+OFRS_MAX_SIDE = 1024
+OFRS_NET_STRIDE = 8  # matches the 3 stride-2 DownBlocks in ofrs/model.py
 
 # Spatially-weighted cross-entropy (paper: heavier at road edges & far from
 # image centre). base weight + edge bonus within `edge_px`, scaled by radial dist.

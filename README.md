@@ -144,7 +144,26 @@ goal of deploying with Mask2Former):
   **human** semantics for training, then swapped to DeepLabv3+ at inference.
   Here the semantic input comes from **Mask2Former at both train and inference**,
   so there is no train/inference domain shift.
-* Everything is resized to `config.OFRS_INPUT_SIZE = (384, 1248)` (paper's size).
+* The paper resizes every image to a fixed 384×1248 canvas. **We don't.**
+  OFRSNet is fully convolutional (the global context block uses adaptive
+  pooling; every up-sampling stage targets its skip connection's own shape),
+  so it accepts any resolution or aspect ratio natively. Each image is only
+  (a) uniformly downscaled — same factor on both axes, aspect ratio exactly
+  preserved — if it exceeds `config.OFRS_MAX_SIDE` (1024px, purely to bound
+  compute), then (b) padded with the `unlabeled` class up to a multiple of
+  `config.OFRS_NET_STRIDE` (8) so the /8 down/up-sampling lines up, and the
+  padding is cropped back off afterward. This matters because the old fixed
+  384×1248 (aspect 3.25) canvas was fine for KITTI (aspect ≈3.31, negligible
+  distortion) but **stretched portrait phone photos by ~5.8×** — a real
+  contributor to poor generalization on real-world footage, not just a
+  difference in camera angle. Training batches mix images of different native
+  shapes via a custom collate (`ofrs_collate` in `src/ofrs/dataset.py`) that
+  pads each batch only up to its own max size; padded pixels get weight 0 and
+  never affect the loss or the reported IoU.
+* **If you have an existing checkpoint trained under the old fixed-canvas
+  behavior, retrain.** Its weights were fit entirely on squashed/stretched
+  geometry; running it through the new native-resolution pipeline puts it
+  further out of distribution, not closer.
 
 All OFRS knobs (class scheme, Mapillary→11 mapping, loss weights, label
 smoothing, split, epochs) live in `config.py`.
@@ -253,8 +272,14 @@ Everything tunable lives in `config.py`:
   (substring-matched against the model's labels, so spelling-robust).
 * `FOREGROUND_DILATE_PX` — grow object masks to cover anti-aliased edges.
 * `ROAD_NEIGHBOURHOOD_PX` — how close to the road an object must be to count as
-  an occluder (controls the occlusion hint).
+  an occluder (used by `common.occluder_blob_mask`'s whole-blob eligibility test).
 * `SPLIT` — `training` (has road GT → amodal labels) or `testing`.
+* `OFRS_MAX_SIDE` — cap on the longer image side (px) before feeding OFRSNet;
+  downscales uniformly (aspect preserved) only if exceeded. Raise it for more
+  detail at the cost of compute, lower it if inference is too slow.
+* `OFRS_NET_STRIDE` — the network's total downsampling factor (8); images are
+  padded up to a multiple of this so the internal down/up-sampling lines up.
+  Only change this if you also change the number of DownBlocks in `ofrs/model.py`.
 
 ---
 

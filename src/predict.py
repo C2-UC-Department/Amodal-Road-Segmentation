@@ -39,7 +39,6 @@ import config  # noqa: E402
 from src import common  # noqa: E402
 from src import s3_detect_foreground as s3  # noqa: E402
 from src import s5_export_semantics as s5  # noqa: E402
-from src.s4_build_incomplete import dilate  # noqa: E402  (reuse "near-road" occluder def)
 from src.ofrs.model import OFRSNet  # noqa: E402
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -73,28 +72,42 @@ def load_ofrsnet(ckpt_path: Path, device):
 
 
 @torch.no_grad()
-def predict_amodal(model, sem_labels: np.ndarray, out_hw: tuple[int, int],
-                   device, threshold: float = 0.5) -> np.ndarray:
-    """sem_labels (H,W) int 0..10 -> predicted amodal road mask at out_hw (bool).
+def predict_amodal(model, sem_labels: np.ndarray, device,
+                   threshold: float = 0.5) -> np.ndarray:
+    """sem_labels (H,W) int 0..10, at NATIVE resolution -> predicted amodal
+    road mask, same (H,W), bool.
 
-    Upsampling to `out_hw` is done in PROBABILITY space with bilinear
-    interpolation (matching the paper: bilinear upsampling throughout, never
-    nearest-neighbor), then thresholded once at the very end. Thresholding a
-    hard label at low res and nearest-upsampling it (the previous approach)
-    stair-steps the boundary a second time on top of the network's own /8
-    bottleneck — that double discretization was the main source of jaggedness.
+    OFRSNet is fully convolutional (global context uses adaptive pooling;
+    every up-sampling stage targets its skip connection's own shape), so no
+    resize to a fixed canvas is needed or performed here -- that used to force
+    every image into a 384x1248 landscape shape, stretching/squashing any
+    image whose native aspect ratio differed (e.g. portrait phone photos).
+
+    Instead: (1) if the image exceeds config.OFRS_MAX_SIDE, uniformly
+    downscale (both axes by the same factor -- aspect ratio is exactly
+    preserved, unlike the old fixed-shape resize) purely to bound compute;
+    (2) pad up to a multiple of config.OFRS_NET_STRIDE so the network's /8
+    down/up-sampling lines up; (3) run the model; (4) crop the padding back
+    off and undo step (1)'s scale (bilinear, still aspect-preserving) to land
+    back at the exact native resolution.
     """
-    h, w = config.OFRS_INPUT_SIZE
-    sem = cv2.resize(sem_labels.astype(np.uint8), (w, h),
-                     interpolation=cv2.INTER_NEAREST).astype(np.int64)
-    sem = np.clip(sem, 0, config.OFRS_NUM_CLASSES - 1)
-    onehot = np.eye(config.OFRS_NUM_CLASSES, dtype=np.float32)[sem].transpose(2, 0, 1)
+    h0, w0 = sem_labels.shape
+    sem_small, scale = common.fit_within_max_side(sem_labels, config.OFRS_MAX_SIDE)
+    sem_padded = common.pad_to_multiple(sem_small, config.OFRS_NET_STRIDE,
+                                        config.OFRS_UNLABELED_ID)
+    sem_padded = np.clip(sem_padded, 0, config.OFRS_NUM_CLASSES - 1).astype(np.int64)
+
+    onehot = np.eye(config.OFRS_NUM_CLASSES, dtype=np.float32)[sem_padded].transpose(2, 0, 1)
     x = torch.from_numpy(onehot).unsqueeze(0).to(device)
 
-    logits = model(x)                                   # (1, 2, h, w)
-    prob_road = F.softmax(logits, dim=1)[:, 1:2]         # (1, 1, h, w)
-    prob_road = F.interpolate(prob_road, size=out_hw, mode="bilinear",
-                              align_corners=False)
+    h, w = sem_small.shape
+    logits = model(x)                                    # (1, 2, H', W') padded
+    prob_road = F.softmax(logits, dim=1)[:, 1:2, :h, :w]  # crop padding off -> (1,1,h,w)
+
+    if scale < 1.0:
+        # Undo step (1): uniform (aspect-preserving) upsample back to native.
+        prob_road = F.interpolate(prob_road, size=(h0, w0), mode="bilinear",
+                                  align_corners=False)
     return (prob_road[0, 0] > threshold).cpu().numpy().astype(bool)
 
 
@@ -113,12 +126,15 @@ def compose_amodal_mask(sem_labels: np.ndarray,
     """
     visible = sem_labels == ROAD_IDX
     occluders = (sem_labels == PERSON_IDX) | (sem_labels == VEHICLE_IDX)
-    # Same "near-road" restriction used to build occlusion hints in Step 3
-    # (config.ROAD_NEIGHBOURHOOD_PX): only occluders touching/near the visible
-    # road can have their footprint patched, so a pedestrian on a distant
-    # sidewalk can't inject an unrelated blob into the mask.
-    road_neigh = dilate(visible, config.ROAD_NEIGHBOURHOOD_PX)
-    occlusion_region = occluders & road_neigh
+    # Whole-blob eligibility (common.occluder_blob_mask): if ANY part of a
+    # person/vehicle blob touches the near-road band, its ENTIRE footprint is
+    # eligible for patching -- not just the pixels within
+    # config.ROAD_NEIGHBOURHOOD_PX of the visible road. A per-pixel version of
+    # this used to only admit a vehicle's tire/undercarriage band (the part
+    # literally close to the road) and silently clip off the rest of the
+    # body, no matter how well OFRSNet reconstructed it.
+    occlusion_region = common.occluder_blob_mask(occluders, visible,
+                                                 config.ROAD_NEIGHBOURHOOD_PX)
 
     patch = ofrsnet_road & occlusion_region
     return (visible | patch), patch
@@ -183,8 +199,7 @@ def main() -> None:
         image = Image.fromarray(rgb)
         seg = s3.segment(processor, model_m2f, device, image)      # mapillary ids
         sem = lut[np.clip(seg, 0, len(lut) - 1)]                    # OFRS 0..10
-        ofrs_road = predict_amodal(ofrsnet, sem, rgb.shape[:2], device,
-                                   threshold=args.threshold)
+        ofrs_road = predict_amodal(ofrsnet, sem, device, threshold=args.threshold)
         amodal, patch = compose_amodal_mask(sem, ofrs_road)
 
         common.write_mask(out_dir / "mask" / f"{path.stem}.png", amodal)

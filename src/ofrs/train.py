@@ -7,6 +7,13 @@ Target : occlusion-free road masks    (data/amodal_road/)
     python -m src.ofrs.train --epochs 100 --batch-size 4 --lr 1e-3
 
 Checkpoints (best val road-IoU + last) are written to checkpoints/.
+
+Each sample keeps its own native resolution/aspect ratio (only capped if it
+exceeds config.OFRS_MAX_SIDE) -- there is no fixed training canvas, so
+portrait, landscape, and any other aspect ratio train side by side without
+distortion. Batching uses `ofrs_collate` (src/ofrs/dataset.py), which pads
+samples of different shapes up to that batch's own max size; padded pixels
+carry weight=0 and are excluded from both the loss and the reported IoU.
 """
 from __future__ import annotations
 
@@ -22,15 +29,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import config  # noqa: E402
 from src import common  # noqa: E402
 from src.ofrs.dataset import (OFRSDataset, annotated_bases,  # noqa: E402
-                              split_bases)
+                              ofrs_collate, split_bases)
 from src.ofrs.loss import SpatiallyWeightedCELoss  # noqa: E402
 from src.ofrs.model import OFRSNet  # noqa: E402
 
 
 @torch.no_grad()
-def road_iou(logits, target):
+def road_iou(logits, target, valid):
+    """IoU restricted to `valid` pixels -- excludes collate-padding (batched
+    samples of different native shapes are padded up to a shared canvas; see
+    ofrs_collate), so padding never inflates or deflates the reported metric.
+    """
     pred = logits.argmax(1)
-    p, t = pred == 1, target == 1
+    p = (pred == 1) & valid
+    t = (target == 1) & valid
     inter = (p & t).sum().item()
     union = (p | t).sum().item()
     return inter / union if union else 1.0
@@ -40,11 +52,11 @@ def evaluate(model, loader, device, criterion):
     model.eval()
     losses, ious = [], []
     with torch.no_grad():
-        for x, y, w, _ in loader:
-            x, y, w = x.to(device), y.to(device), w.to(device)
+        for x, y, w, valid, _ in loader:
+            x, y, w, valid = x.to(device), y.to(device), w.to(device), valid.to(device)
             out = model(x)
             losses.append(criterion(out, y, w).item())
-            ious.append(road_iou(out, y))
+            ious.append(road_iou(out, y, valid))
     return float(np.mean(losses)), float(np.mean(ious))
 
 
@@ -76,9 +88,11 @@ def main() -> None:
     # MPS/CPU: pin_memory only helps CUDA.
     pin = device.type == "cuda"
     train_ld = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                          num_workers=args.workers, pin_memory=pin, drop_last=False)
+                          num_workers=args.workers, pin_memory=pin, drop_last=False,
+                          collate_fn=ofrs_collate)
     val_ld = DataLoader(val_ds, batch_size=1, shuffle=False,
-                        num_workers=args.workers, pin_memory=pin)
+                        num_workers=args.workers, pin_memory=pin,
+                        collate_fn=ofrs_collate)
 
     model = OFRSNet(in_channels=config.OFRS_NUM_CLASSES, num_classes=2).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -92,7 +106,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         ep_losses = []
-        for x, y, w, _ in train_ld:
+        for x, y, w, _valid, _ in train_ld:
             x, y, w = x.to(device), y.to(device), w.to(device)
             optim.zero_grad()
             loss = criterion(model(x), y, w)

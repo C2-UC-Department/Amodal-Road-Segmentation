@@ -1,13 +1,14 @@
 """Step 3: Build the "incomplete road" + occlusion-hint masks.
 
 For each image we combine the visible-road mask (KITTI) with the foreground
-mask (Mask2Former) to identify where the road is likely occluded:
+mask (Mask2Former) to identify where the road is likely occluded. The hint
+uses whole-object eligibility (see common.occluder_blob_mask): if a foreground
+blob (e.g. a vehicle) touches the visible road anywhere, its ENTIRE footprint
+counts as occluding the road -- not just the sliver of it within a fixed pixel
+radius, which for a vehicle would be only the tire/undercarriage band.
 
-    occlusion_hint = foreground AND (dilate(visible_road) )
-
-i.e. foreground-object pixels that sit inside or right next to the visible
-road are the regions the annotator must "hallucinate" road into. This is only
-a *hint* to guide annotation; the ground truth is produced by hand in Step 4.
+This is only a *hint* to guide annotation; the ground truth is produced by
+hand in Step 4.
 
 Also seeds the amodal output: if no amodal mask exists yet for an image, we
 initialise it to a copy of the visible-road mask so the annotator starts from
@@ -23,7 +24,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -31,14 +31,6 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
 from src import common  # noqa: E402
-
-
-def dilate(mask: np.ndarray, px: int) -> np.ndarray:
-    if px <= 0:
-        return mask
-    k = 2 * px + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    return cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
 
 
 def main() -> None:
@@ -64,8 +56,8 @@ def main() -> None:
         visible = common.read_mask(vis_path)
         foreground = common.read_mask(fg_path)
 
-        road_neigh = dilate(visible, config.ROAD_NEIGHBOURHOOD_PX)
-        occlusion = foreground & road_neigh
+        occlusion = common.occluder_blob_mask(foreground, visible,
+                                              config.ROAD_NEIGHBOURHOOD_PX)
         common.write_mask(config.OCCLUSION_DIR / f"{s.base}.png", occlusion)
 
         # Seed the amodal mask from the visible road (annotator will extend it).
