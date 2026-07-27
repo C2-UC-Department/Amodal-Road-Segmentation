@@ -61,7 +61,7 @@ def main() -> None:
     device = common.pick_device()
     print(f"[device] {device}")
 
-    bases = annotated_bases(config.SPLIT)
+    bases = annotated_bases()
     if not bases:
         raise SystemExit(
             "No annotated samples found. You need BOTH a semantic map "

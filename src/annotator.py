@@ -1,18 +1,33 @@
 """Step 4: Interactive amodal road annotation tool (OpenCV HighGUI).
 
-Loads, per KITTI image:
+Loads, per image:
   * the original RGB image,
   * the visible-road mask     (blue overlay),
   * the foreground-object mask (red overlay),
   * the occlusion hint        (yellow overlay),
 and lets you paint/erase the *amodal* road mask (green overlay) to reconstruct
 road hidden behind foreground objects. The amodal mask is saved as a 0/255 PNG
-to data/amodal_road/<base>.png, preserving the KITTI base name.
+to data/amodal_road/<base>.png, preserving the source's base name.
+
+Two sources are supported (--source):
+  kitti   (default) -- visible road comes from KITTI's ground truth; occlusion
+          hint from data/processed/occlusion/; unannotated frames seed the
+          amodal mask from the visible road alone.
+  footage -- no ground truth exists. "Visible road" is instead Mask2Former's
+          own road class (from data/processed/semantic_ofrs/, run
+          `python -m src.s6_prepare_footage` first); the occlusion hint is
+          computed on the fly. Unannotated frames are pre-seeded by
+          s6_prepare_footage from the model's own composed prediction
+          (Mask2Former road + OFRSNet patch), so you correct the model's
+          mistakes directly instead of drawing from scratch.
 
 This tool uses OpenCV's native window (the project's pyenv Python has no Tk).
+It never imports torch -- footage seeding is a separate precompute step
+(s6_prepare_footage.py), keeping this editor lightweight.
 
 Run:
     python -m src.annotator
+    python -m src.annotator --source footage
     python -m src.annotator --start 0
 
 Controls
@@ -46,6 +61,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
 from src import common  # noqa: E402
+from src.s4_build_incomplete import dilate  # noqa: E402  (footage occlusion hint)
 
 WINDOW = "amodal-road-annotator"
 MAX_CANVAS_W, MAX_CANVAS_H = 1280, 760
@@ -56,6 +72,8 @@ COL_FOREGROUND = (255, 60, 60)
 COL_OCCLUSION = (255, 210, 0)
 COL_AMODAL = (40, 220, 90)
 UNDO_LIMIT = 40
+
+ROAD_IDX = config.OFRS_CLASSES.index("road")
 
 
 def _wheel_delta(flags: int) -> int:
@@ -70,11 +88,11 @@ def _wheel_delta(flags: int) -> int:
 
 
 class Annotator:
-    def __init__(self, split: str, start: int):
-        self.split = split
-        self.samples = list(common.iter_samples(split))
+    def __init__(self, source: str, start: int):
+        self.source = source
+        self.samples = list(common.iter_source_samples(source))
         if not self.samples:
-            raise SystemExit(f"No KITTI samples found for split '{split}'.")
+            raise SystemExit(f"No samples found for source '{source}'.")
         self.idx = max(0, min(start, len(self.samples) - 1))
 
         self.zoom = 1.0
@@ -121,9 +139,25 @@ class Annotator:
         s = self.samples[self.idx]
         self.rgb = common.read_rgb(s.image_path)
         h, w = self.rgb.shape[:2]
-        self.visible = self._opt_mask(config.VISIBLE_DIR, s.base, (h, w))
         self.foreground = self._opt_mask(config.FOREGROUND_DIR, s.base, (h, w))
-        self.occlusion = self._opt_mask(config.OCCLUSION_DIR, s.base, (h, w))
+
+        if self.source == "kitti":
+            self.visible = self._opt_mask(config.VISIBLE_DIR, s.base, (h, w))
+            self.occlusion = self._opt_mask(config.OCCLUSION_DIR, s.base, (h, w))
+        else:
+            # footage: no ground truth -- "visible road" is Mask2Former's own
+            # road class (run s6_prepare_footage first); occlusion hint is
+            # computed on the fly, same formula as Step 3 for KITTI.
+            sem_path = config.SEMANTIC_DIR / f"{s.base}.png"
+            if sem_path.exists():
+                sem = cv2.imread(str(sem_path), cv2.IMREAD_GRAYSCALE)
+                self.visible = sem == ROAD_IDX
+            else:
+                print(f"[warn] no semantic map for {s.base}; "
+                      "run `python -m src.s6_prepare_footage` first")
+                self.visible = np.zeros((h, w), bool)
+            self.occlusion = self.foreground & dilate(self.visible,
+                                                      config.ROAD_NEIGHBOURHOOD_PX)
 
         amodal_path = config.AMODAL_DIR / f"{s.base}.png"
         if amodal_path.exists():
@@ -380,12 +414,12 @@ class Annotator:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--split", default=config.SPLIT)
+    ap.add_argument("--source", choices=["kitti", "footage"], default="kitti")
     ap.add_argument("--start", type=int, default=0, help="index to start at")
     args = ap.parse_args()
 
     config.AMODAL_DIR.mkdir(parents=True, exist_ok=True)
-    Annotator(split=args.split, start=args.start).run()
+    Annotator(source=args.source, start=args.start).run()
 
 
 if __name__ == "__main__":

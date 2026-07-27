@@ -70,6 +70,36 @@ def list_bases(split: str = config.SPLIT) -> list[str]:
     return [s.base for s in iter_samples(split)]
 
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+
+def iter_footage_samples() -> Iterator[Sample]:
+    """Yield every extracted real-world frame under config.FRAMES_DIR.
+
+    There is no ground truth for footage frames (gt_path is always None) --
+    unlike KITTI, "visible road" and the amodal seed must come from the model
+    itself (Mask2Former semantics / OFRSNet), not a dataset annotation.
+    """
+    if not config.FRAMES_DIR.exists():
+        raise FileNotFoundError(
+            f"No footage frames at {config.FRAMES_DIR}. Run "
+            "`python -m src.extract_frames` first."
+        )
+    for image_path in sorted(config.FRAMES_DIR.rglob("*")):
+        if image_path.suffix.lower() in IMAGE_EXTS:
+            yield Sample(base=image_path.stem, image_path=image_path, gt_path=None)
+
+
+def iter_source_samples(source: str) -> Iterator[Sample]:
+    """Dispatch to the right sample iterator by source name."""
+    if source == "kitti":
+        yield from iter_samples(config.SPLIT)
+    elif source == "footage":
+        yield from iter_footage_samples()
+    else:
+        raise ValueError(f"unknown source {source!r} (expected 'kitti' or 'footage')")
+
+
 # --------------------------------------------------------------------------- #
 # Mask IO (single-channel 0/255 PNG)
 # --------------------------------------------------------------------------- #

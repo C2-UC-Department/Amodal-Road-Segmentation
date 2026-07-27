@@ -27,14 +27,17 @@ import config  # noqa: E402
 from src import common  # noqa: E402
 
 
-def annotated_bases(split: str = config.SPLIT) -> list[str]:
-    """Bases that have both a semantic map and an amodal (target) mask."""
-    out = []
-    for s in common.iter_samples(split):
-        if (config.SEMANTIC_DIR / f"{s.base}.png").exists() and \
-           (config.AMODAL_DIR / f"{s.base}.png").exists():
-            out.append(s.base)
-    return out
+def annotated_bases() -> list[str]:
+    """Bases with both a semantic map and a hand-corrected amodal mask.
+
+    Pooled across ALL sources (KITTI + footage) -- both write into the same
+    flat SEMANTIC_DIR/AMODAL_DIR namespace with source-distinct base names
+    (KITTI: um_/umm_/uu_..., footage: IMG_.../ScreenRecording_...), so a plain
+    filename intersection is a correct union of everything annotated so far.
+    """
+    sem_bases = {p.stem for p in config.SEMANTIC_DIR.glob("*.png")}
+    amodal_bases = {p.stem for p in config.AMODAL_DIR.glob("*.png")}
+    return sorted(sem_bases & amodal_bases)
 
 
 def split_bases(bases: list[str]) -> tuple[list[str], list[str]]:

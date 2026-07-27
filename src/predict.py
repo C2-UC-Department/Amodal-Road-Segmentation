@@ -2,11 +2,19 @@
 
 Pipeline per image:
     RGB  --Mask2Former(Mapillary)-->  11-class OFRS semantic map
-         --one-hot, resize 384x1248-->  OFRSNet  -->  amodal road mask
-         --resize back-->  overlay on the original image.
+         --one-hot, resize 384x1248-->  OFRSNet  -->  road-probability map
+         --bilinear resize back-->  threshold  -->  OFRSNet road prediction
+
+The FINAL amodal mask is NOT OFRSNet's raw output. OFRSNet is only trusted to
+patch the footprint of nearby occluders (person/vehicle classes touching the
+visible road); the rest of the mask is Mask2Former's own visible-road
+segmentation, untouched. See `compose_amodal_mask()`.
+
+    final = mask2former_visible_road  OR  (ofrsnet_road AND occluder_footprint)
 
 Writes, for each input image, a stacked visualization (original / semantic /
-predicted amodal road) to the output dir, plus the raw binary mask.
+final amodal road, with OFRSNet's patch contribution highlighted) to the
+output dir, plus the raw binary mask.
 
 Usage:
     python -m src.predict --input path/to/images --out data/predictions
@@ -22,6 +30,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -30,11 +39,17 @@ import config  # noqa: E402
 from src import common  # noqa: E402
 from src import s3_detect_foreground as s3  # noqa: E402
 from src import s5_export_semantics as s5  # noqa: E402
+from src.s4_build_incomplete import dilate  # noqa: E402  (reuse "near-road" occluder def)
 from src.ofrs.model import OFRSNet  # noqa: E402
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-COL_ROAD = (40, 220, 90)     # predicted amodal road (green)
+COL_ROAD = (40, 220, 90)     # final amodal road (Mask2Former visible + OFRSNet patch)
+COL_PATCH = (0, 210, 255)    # the part of the mask actually contributed by OFRSNet
 COL_OBJECT = (255, 60, 60)   # person/vehicle from semantics (red)
+
+ROAD_IDX = config.OFRS_CLASSES.index("road")
+PERSON_IDX = config.OFRS_CLASSES.index("person")
+VEHICLE_IDX = config.OFRS_CLASSES.index("vehicle")
 
 
 def list_images(root: Path) -> list[Path]:
@@ -59,28 +74,65 @@ def load_ofrsnet(ckpt_path: Path, device):
 
 @torch.no_grad()
 def predict_amodal(model, sem_labels: np.ndarray, out_hw: tuple[int, int],
-                   device) -> np.ndarray:
-    """sem_labels (H,W) int 0..10 -> predicted amodal road mask at out_hw (bool)."""
+                   device, threshold: float = 0.5) -> np.ndarray:
+    """sem_labels (H,W) int 0..10 -> predicted amodal road mask at out_hw (bool).
+
+    Upsampling to `out_hw` is done in PROBABILITY space with bilinear
+    interpolation (matching the paper: bilinear upsampling throughout, never
+    nearest-neighbor), then thresholded once at the very end. Thresholding a
+    hard label at low res and nearest-upsampling it (the previous approach)
+    stair-steps the boundary a second time on top of the network's own /8
+    bottleneck — that double discretization was the main source of jaggedness.
+    """
     h, w = config.OFRS_INPUT_SIZE
     sem = cv2.resize(sem_labels.astype(np.uint8), (w, h),
                      interpolation=cv2.INTER_NEAREST).astype(np.int64)
     sem = np.clip(sem, 0, config.OFRS_NUM_CLASSES - 1)
     onehot = np.eye(config.OFRS_NUM_CLASSES, dtype=np.float32)[sem].transpose(2, 0, 1)
     x = torch.from_numpy(onehot).unsqueeze(0).to(device)
-    pred = model(x).argmax(1)[0].cpu().numpy().astype(np.uint8)   # (h,w)
-    return cv2.resize(pred, (out_hw[1], out_hw[0]),
-                      interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    logits = model(x)                                   # (1, 2, h, w)
+    prob_road = F.softmax(logits, dim=1)[:, 1:2]         # (1, 1, h, w)
+    prob_road = F.interpolate(prob_road, size=out_hw, mode="bilinear",
+                              align_corners=False)
+    return (prob_road[0, 0] > threshold).cpu().numpy().astype(bool)
 
 
-def make_stack(rgb, sem_labels, amodal) -> np.ndarray:
-    """Vertical stack: original / semantic / amodal overlay."""
+def compose_amodal_mask(sem_labels: np.ndarray,
+                        ofrsnet_road: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Merge Mask2Former's visible road with ONLY the occluded-region patch
+    predicted by OFRSNet -- OFRSNet's output never replaces or redraws the
+    already-visible road, it only fills the footprint of nearby occluders.
+
+    This keeps the boundary of the open road exactly as clean as Mask2Former's
+    own segmentation; any residual jaggedness from OFRSNet is confined to the
+    small patched regions instead of the whole mask.
+
+    Returns (final_mask, patch_mask) -- `patch_mask` is the subset of
+    `final_mask` that came from OFRSNet, useful for QA visualization.
+    """
+    visible = sem_labels == ROAD_IDX
+    occluders = (sem_labels == PERSON_IDX) | (sem_labels == VEHICLE_IDX)
+    # Same "near-road" restriction used to build occlusion hints in Step 3
+    # (config.ROAD_NEIGHBOURHOOD_PX): only occluders touching/near the visible
+    # road can have their footprint patched, so a pedestrian on a distant
+    # sidewalk can't inject an unrelated blob into the mask.
+    road_neigh = dilate(visible, config.ROAD_NEIGHBOURHOOD_PX)
+    occlusion_region = occluders & road_neigh
+
+    patch = ofrsnet_road & occlusion_region
+    return (visible | patch), patch
+
+
+def make_stack(rgb, sem_labels, amodal, patch) -> np.ndarray:
+    """Vertical stack: original / semantic / final amodal overlay."""
     sem_color = s5.OFRS_PALETTE[sem_labels]
     sem_blend = (0.45 * rgb + 0.55 * sem_color).astype(np.uint8)
 
-    obj = np.isin(sem_labels, [config.OFRS_CLASSES.index("person"),
-                               config.OFRS_CLASSES.index("vehicle")])
+    obj = np.isin(sem_labels, [PERSON_IDX, VEHICLE_IDX])
     over = common.overlay_mask(rgb, amodal, COL_ROAD, 0.5)
     over = common.overlay_mask(over, obj, COL_OBJECT, 0.35)
+    over = common.overlay_mask(over, patch, COL_PATCH, 0.6)  # highlight OFRSNet's contribution
 
     def label(img, text):
         img = img.copy()
@@ -91,7 +143,7 @@ def make_stack(rgb, sem_labels, amodal) -> np.ndarray:
 
     return np.vstack([label(rgb, "input"),
                       label(sem_blend, "Mask2Former semantics (OFRS 11-class)"),
-                      label(over, "OFRSNet predicted amodal road (green)")])
+                      label(over, "Mask2Former road (green) + OFRSNet patch (cyan)")])
 
 
 def main() -> None:
@@ -101,6 +153,8 @@ def main() -> None:
     ap.add_argument("--out", default=str(config.DATA_DIR / "predictions"))
     ap.add_argument("--ckpt", default=str(config.CKPT_DIR / "ofrsnet_best.pt"))
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--threshold", type=float, default=0.5,
+                    help="road-probability threshold after bilinear upsampling")
     ap.add_argument("--no-stack", action="store_true",
                     help="save only the amodal overlay, not the 3-panel stack")
     args = ap.parse_args()
@@ -129,13 +183,16 @@ def main() -> None:
         image = Image.fromarray(rgb)
         seg = s3.segment(processor, model_m2f, device, image)      # mapillary ids
         sem = lut[np.clip(seg, 0, len(lut) - 1)]                    # OFRS 0..10
-        amodal = predict_amodal(ofrsnet, sem, rgb.shape[:2], device)
+        ofrs_road = predict_amodal(ofrsnet, sem, rgb.shape[:2], device,
+                                   threshold=args.threshold)
+        amodal, patch = compose_amodal_mask(sem, ofrs_road)
 
         common.write_mask(out_dir / "mask" / f"{path.stem}.png", amodal)
         if args.no_stack:
             viz = common.overlay_mask(rgb, amodal, COL_ROAD, 0.5)
+            viz = common.overlay_mask(viz, patch, COL_PATCH, 0.6)
         else:
-            viz = make_stack(rgb, sem, amodal)
+            viz = make_stack(rgb, sem, amodal, patch)
         Image.fromarray(viz).save(out_dir / f"{path.stem}_viz.png")
 
     print(f"[ok] wrote predictions to {out_dir}")

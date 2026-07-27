@@ -25,12 +25,16 @@ road, so we:
 | 1b | `src/s2_prepare_visible_masks.py` | KITTI GT | `data/processed/visible_road/*.png` |
 | 2  | `src/s3_detect_foreground.py` | KITTI images | `data/processed/foreground/*.png` |
 | 3  | `src/s4_build_incomplete.py` | visible + foreground | `data/processed/occlusion/*.png`, seeded `data/amodal_road/*.png` |
-| 5  | `src/s5_export_semantics.py` | KITTI images | `data/processed/semantic_ofrs/*.png` (**OFRSNet input**) |
+| 5  | `src/s5_export_semantics.py` | KITTI images (or `--source footage`) | `data/processed/semantic_ofrs/*.png` (**OFRSNet input**) |
 | 4  | `src/annotator.py` | all of the above | **`data/amodal_road/*.png`** (final GT) |
-| 6  | `src/ofrs/train.py` | semantic + amodal | `checkpoints/ofrsnet_best.pt` |
+| 6a | `src/extract_frames.py` | `data/footage/*.mov,.mp4,.heic` | `data/footage_frames/*.jpg` |
+| 6b | `src/s6_prepare_footage.py` | footage frames + checkpoint | model-seeded `data/amodal_road/*.png` |
+| 7  | `src/ofrs/train.py` | semantic + amodal (KITTI + footage, pooled) | `checkpoints/ofrsnet_best.pt` |
+| 8  | `src/predict.py` | any image folder | predicted amodal road + visualization |
 
-All masks are single-channel **0/255 PNG**, one per image, sharing the KITTI
-base name (`um_000000.png`, `umm_000012.png`, `uu_000003.png`, …).
+All masks are single-channel **0/255 PNG**, one per image, sharing the source's
+base name (`um_000000.png`, `umm_000012.png`, `uu_000003.png` for KITTI;
+`IMG_0056_f00002.png` for footage frames).
 
 ---
 
@@ -113,7 +117,7 @@ an image loads your saved amodal mask, so you can stop and resume anytime.
 
 ---
 
-## Training OFRSNet (Steps 5–6)
+## Training OFRSNet (Steps 5, 7)
 
 Per the paper (*Occlusion-Free Road Segmentation Leveraging Semantics*, Sensors
 2019), **OFRSNet's input is a semantic map, not RGB**:
@@ -145,11 +149,11 @@ goal of deploying with Mask2Former):
 All OFRS knobs (class scheme, Mapillary→11 mapping, loss weights, label
 smoothing, split, epochs) live in `config.py`.
 
-## Inference on your own images (Step 7)
+## Inference on your own images (Step 8)
 
-`src/predict.py` runs the full deploy pipeline on any folder of images
-(RGB → Mask2Former semantics → OFRSNet → amodal road) and writes a 3-panel
-visualization (input / semantics / predicted amodal road) plus the raw mask.
+`src/predict.py` runs the full deploy pipeline on any folder of images and
+writes a 3-panel visualization (input / semantics / final amodal road) plus
+the raw mask.
 
 ```bash
 python -m src.predict --input path/to/images --out data/predictions
@@ -157,9 +161,65 @@ python -m src.predict --input data/raw/data_road/testing/image_2 --limit 20
 python -m src.predict --input dashcam/ --ckpt checkpoints/ofrsnet_best.pt --no-stack
 ```
 
+The final mask is **not** OFRSNet's raw output. OFRSNet's road-probability map
+is bilinear-upsampled to full resolution and thresholded (never nearest-
+neighbor, which double stair-steps the boundary), and then only the part of
+its prediction that falls inside a nearby occluder's footprint (person/vehicle
+touching the visible road) is kept:
+
+```
+final = mask2former_visible_road  OR  (ofrsnet_road AND occluder_footprint)
+```
+
+So the open-road boundary is always Mask2Former's own clean segmentation;
+OFRSNet only patches the gaps under obstacles. In the visualization, that
+patch contribution is highlighted in **cyan** on top of the green final mask.
+
 Outputs: `data/predictions/<name>_viz.png` (stacked visualization) and
 `data/predictions/mask/<name>.png` (binary amodal road). Accepts png/jpg/bmp/tif
 and recurses into sub-directories.
+
+---
+
+## Annotating real-world footage (Steps 6a–6b)
+
+KITTI (Karlsruhe, Germany) has very few motorcycles and a fixed camera
+perspective, so OFRSNet trained on it alone generalizes poorly to scenes with
+motorcycles or a different camera angle. To close that gap, extract frames
+from your own footage and annotate a batch of them alongside KITTI:
+
+```bash
+# 6a: turn data/footage (iPhone .mov/.mp4/.heic, or any video/image folder)
+#     into sampled JPG/PNG snapshots
+python -m src.extract_frames --fps 0.5 --max-size 1280
+#   --fps        frames sampled per second of video (default 1.0)
+#   --max-size   cap the longest side in px, downscale only (0 = native)
+#   --input/--out  override source/destination directories
+
+# 6b: seed each frame's amodal mask from the model's OWN current prediction
+#     (Mask2Former visible road + OFRSNet's occluded-region patch) instead of
+#     a blank mask -- you correct the model's mistakes directly, which puts
+#     you right on the motorcycle failure cases instead of drawing from scratch.
+#     NEVER overwrites an existing data/amodal_road/<base>.png.
+python -m src.s6_prepare_footage
+python -m src.s6_prepare_footage --limit 20 --ckpt checkpoints/ofrsnet_best.pt
+
+# then correct the seeded masks:
+python -m src.annotator --source footage
+```
+
+Unlike KITTI, footage has no ground truth, so the annotator's "visible road"
+overlay is instead Mask2Former's own `road` class (from
+`data/processed/semantic_ofrs/`), and the occlusion hint is computed on the
+fly from the same near-road restriction used elsewhere in the pipeline
+(`config.ROAD_NEIGHBOURHOOD_PX`).
+
+**Training automatically pools both sources** — `src/ofrs/train.py` calls
+`annotated_bases()`, which is just the filename intersection of
+`data/processed/semantic_ofrs/*.png` and `data/amodal_road/*.png`. Since KITTI
+bases (`um_*`, `umm_*`, `uu_*`) and footage bases (`IMG_*`, `ScreenRecording_*`)
+never collide, annotating footage frames folds them straight into the next
+training run with zero config changes.
 
 ## Final dataset layout
 

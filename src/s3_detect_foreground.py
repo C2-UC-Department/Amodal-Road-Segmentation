@@ -80,6 +80,8 @@ def foreground_from_seg(seg: np.ndarray, fg_ids: set[int], dilate_px: int) -> np
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--source", choices=["kitti", "footage"], default="kitti",
+                    help="kitti = data_road images; footage = data/footage_frames")
     ap.add_argument("--limit", type=int, default=0, help="process only N images (0 = all)")
     ap.add_argument("--preview", action="store_true", help="write QA overlays too")
     ap.add_argument("--overwrite", action="store_true", help="recompute existing masks")
@@ -92,7 +94,7 @@ def main() -> None:
     device = common.pick_device()
     processor, model, fg_ids = load_model(device)
 
-    samples = list(common.iter_samples(config.SPLIT))
+    samples = list(common.iter_source_samples(args.source))
     if args.limit:
         samples = samples[: args.limit]
 
