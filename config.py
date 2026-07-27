@@ -27,6 +27,10 @@ SEMANTIC_DIR = PROC_DIR / "semantic_ofrs"    # 11-class OFRS semantic label map 
 # Final, human-corrected amodal ground truth (annotator output)
 AMODAL_DIR = DATA_DIR / "amodal_road"
 
+# Real-world footage (your own videos) and extracted image snapshots
+FOOTAGE_DIR = DATA_DIR / "footage"
+FRAMES_DIR = DATA_DIR / "footage_frames"
+
 # OFRSNet training artefacts
 CKPT_DIR = ROOT / "checkpoints"
 
