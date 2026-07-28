@@ -34,6 +34,13 @@ from src.ofrs.loss import SpatiallyWeightedCELoss  # noqa: E402
 from src.ofrs.model import OFRSNet  # noqa: E402
 
 
+def to_device_geo(geo, device):
+    """Move the geometry dict to `device` (None passes straight through)."""
+    if geo is None:
+        return None
+    return {k: v.to(device) for k, v in geo.items()}
+
+
 @torch.no_grad()
 def road_iou(logits, target, valid):
     """IoU restricted to `valid` pixels -- excludes collate-padding (batched
@@ -52,9 +59,10 @@ def evaluate(model, loader, device, criterion):
     model.eval()
     losses, ious = [], []
     with torch.no_grad():
-        for x, y, w, valid, _ in loader:
+        for x, y, w, valid, geo, _ in loader:
             x, y, w, valid = x.to(device), y.to(device), w.to(device), valid.to(device)
-            out = model(x)
+            geo = to_device_geo(geo, device)
+            out = model(x, geo)
             losses.append(criterion(out, y, w).item())
             ious.append(road_iou(out, y, valid))
     return float(np.mean(losses)), float(np.mean(ious))
@@ -106,10 +114,11 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         ep_losses = []
-        for x, y, w, _valid, _ in train_ld:
+        for x, y, w, _valid, geo, _ in train_ld:
             x, y, w = x.to(device), y.to(device), w.to(device)
+            geo = to_device_geo(geo, device)
             optim.zero_grad()
-            loss = criterion(model(x), y, w)
+            loss = criterion(model(x, geo), y, w)
             loss.backward()
             optim.step()
             ep_losses.append(loss.item())
@@ -120,14 +129,16 @@ def main() -> None:
               f"val_loss {val_loss:.4f}  val_road_IoU {val_iou:.4f}  "
               f"lr {sched.get_last_lr()[0]:.2e}")
 
-        torch.save({"model": model.state_dict(), "epoch": epoch,
-                    "val_iou": val_iou, "config_classes": config.OFRS_CLASSES},
-                   config.CKPT_DIR / "ofrsnet_last.pt")
+        ckpt = {"model": model.state_dict(), "epoch": epoch,
+                "val_iou": val_iou, "config_classes": config.OFRS_CLASSES,
+                # Architecture flag: predict.py rebuilds the matching module,
+                # so a geometry-trained checkpoint cannot be silently loaded
+                # into a semantic-only network (or vice versa).
+                "use_geometry": model.use_geometry}
+        torch.save(ckpt, config.CKPT_DIR / "ofrsnet_last.pt")
         if val_iou > best_iou:
             best_iou = val_iou
-            torch.save({"model": model.state_dict(), "epoch": epoch,
-                        "val_iou": val_iou, "config_classes": config.OFRS_CLASSES},
-                       config.CKPT_DIR / "ofrsnet_best.pt")
+            torch.save(ckpt, config.CKPT_DIR / "ofrsnet_best.pt")
             print(f"       * new best road IoU {best_iou:.4f} -> ofrsnet_best.pt")
 
     print(f"[done] best val road IoU {best_iou:.4f}")

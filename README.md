@@ -29,7 +29,8 @@ road, so we:
 | 4  | `src/annotator.py` | all of the above | **`data/amodal_road/*.png`** (final GT) |
 | 6a | `src/extract_frames.py` | `data/footage/*.mov,.mp4,.heic` | `data/footage_frames/*.jpg` |
 | 6b | `src/s6_prepare_footage.py` | footage frames + checkpoint | model-seeded `data/amodal_road/*.png` |
-| 7  | `src/ofrs/train.py` | semantic + amodal (KITTI + footage, pooled) | `checkpoints/ofrsnet_best.pt` |
+| 6c | `src/s7_export_geometry.py` | images + semantic maps | `data/processed/geometry/*.npz` (**ground manifold**) |
+| 7  | `src/ofrs/train.py` | semantic + geometry + amodal (KITTI + footage, pooled) | `checkpoints/ofrsnet_best.pt` |
 | 8  | `src/predict.py` | any image folder | predicted amodal road + visualization |
 
 All masks are single-channel **0/255 PNG**, one per image, sharing the source's
@@ -168,6 +169,95 @@ goal of deploying with Mask2Former):
 All OFRS knobs (class scheme, Mapillary→11 mapping, loss weights, label
 smoothing, split, epochs) live in `config.py`.
 
+---
+
+## The ground manifold: geometry-guided message passing (Step 6c)
+
+Road completion is reframed as **graph completion on a ground manifold**:
+
+* **Mask2Former** says *what* each visible pixel is (semantic layout).
+* **GroundNet's depth stream** says *where the road surface is in 3D*.
+* The context module propagates semantic evidence preferentially **between
+  pixels that lie on the same ground surface**.
+
+### Why the original context module could not do this
+
+The paper's global-context block computes `z_i = x_i + W_v Σ_j softmax_j(W_k x_j) x_j`.
+Its attention weights do not depend on the query pixel `i` at all — it pools
+**one** global vector and broadcasts it identically everywhere, so no two
+pixels ever exchange information specifically. `MultimodalContextModule`
+replaces that with genuinely query-dependent, geometrically-gated aggregation.
+
+### The two dense fields (`src/geometry.py`)
+
+From monocular metric depth + a RANSAC ground-plane fit (GroundNet Eq. 1–5),
+using our **existing** Mask2Former `road` class to isolate ground pixels:
+
+| Field | Meaning |
+|---|---|
+| **G** `(3,H,W)` | **Ground footprint** — where each pixel's viewing ray meets the plane. Depends only on intrinsics + plane, **not depth**, so it is defined even for occluded pixels. |
+| **h** `(1,H,W)` | **Signed height above the plane** of the pixel's own 3D point. `\|h\|≈0` ⇔ the pixel is genuinely *on* the manifold. |
+| **gvalid** `(1,H,W)` | Ray meets the plane in front of the camera (false above the horizon). |
+
+Measured on real footage, `|h|` separates the manifold cleanly:
+road **0.05–0.09 m** vs vehicles **2.4–3.0 m** — a 34–50× margin.
+
+### The module (`MultimodalContextModule`)
+
+**Tier 1 — ground-weighted pooling.** Weight each pixel by `exp(-|h|/τ_h)`
+before pooling, so the global summary describes the *road surface* instead of
+averaging in cars, buildings and sky.
+
+**Tier 2 — geometry-gated non-local attention.**
+```
+logit(i,j) = <q_i,k_j>/√d  −  α·( ‖G_i − G_j‖² / τ_d  +  |h_j| / τ_h )
+```
+Two deliberate asymmetries, both essential for *amodal* completion:
+
+* The manifold gate `|h|` applies to **keys only**. A query on a car body is
+  off-manifold — but that is precisely the pixel we need to fill in, so it must
+  stay free to gather. What we constrain is the *source* of evidence.
+* Distance uses the **ground footprint G**, not the pixel's own 3D point. A car
+  roof is metres off the manifold, yet its footprint is exactly the road it
+  hides, so it still gathers from the right neighbourhood. Using the raw 3D
+  point would attract occluders to *other elevated things* — the opposite of
+  what is wanted.
+
+`τ_h`, `τ_d`, `α` and the residual scale `γ` are all learnable, so the network
+tunes its own geometric receptive field. `γ` is **zero-initialised**: Tier 2
+starts as an exact no-op and switches itself on during training (Tier 1 is
+active from step one — it is only a reweighted average, so it needs no warm-up).
+
+```bash
+python -m src.s7_export_geometry                  # KITTI
+python -m src.s7_export_geometry --source footage --preview
+```
+
+Geometry is **optional per sample**: images without a cached plane (or where
+the fit failed for lack of visible road) fall back to the original
+semantic-only behaviour, so a partially-precomputed dataset still trains.
+Toggle the whole thing with `config.OFRS_USE_GEOMETRY`; checkpoints record
+which architecture they were trained with, so `predict.py` always rebuilds a
+matching model.
+
+### Honest caveats
+
+* **Depth stream only.** GroundNet's second (surface-normal) stream and its
+  geometric-consistency loss need `diffusers`/Marigold, which is not installed.
+  Per the paper's own ablation (Table 4) depth+RANSAC is the stronger single
+  stream (2.92° vs 6.73° on KITTI), so this captures most of the benefit — but
+  it *is* a reduction from the full published method.
+* **Uncalibrated photos have guessed intrinsics.** KITTI ships real calibration
+  (`calib/*.txt`, `P2`); arbitrary phone photos do not, so we assume a 65°
+  horizontal FOV. Absolute metric scale is then unreliable (our footage implies
+  a ~7 m camera height, which is clearly wrong), but the scale error is
+  *uniform*, so relative co-planarity — the thing the gate actually uses —
+  survives, and the learnable `τ` values absorb the rest.
+* **Unproven for this task.** The mechanism is verified to behave as designed
+  (see the tests), but whether it *improves road completion* is an open
+  empirical question. Train with `OFRS_USE_GEOMETRY = False` and `True` and
+  compare before trusting it.
+
 ## Inference on your own images (Step 8)
 
 `src/predict.py` runs the full deploy pipeline on any folder of images and
@@ -280,6 +370,18 @@ Everything tunable lives in `config.py`:
 * `OFRS_NET_STRIDE` — the network's total downsampling factor (8); images are
   padded up to a multiple of this so the internal down/up-sampling lines up.
   Only change this if you also change the number of DownBlocks in `ofrs/model.py`.
+* `OFRS_USE_GEOMETRY` — master switch for the ground-manifold stream. `False`
+  restores the original semantic-only global-context module (use it for the
+  A/B ablation).
+* `OFRS_ATTN_KV_STRIDE` — keys/values are pooled by this factor, so Tier 2 costs
+  O(N × N/stride²) instead of O(N²). Raise it if attention is too slow/memory
+  hungry, lower it for finer message passing.
+* `OFRS_TAU_H_INIT` / `OFRS_TAU_D_INIT` — initial manifold-membership softness
+  (metres) and ground-plane neighbourhood radius (metres²). Both are *learnable*;
+  these only set the starting point.
+* `GEOM_FALLBACK_HFOV_DEG` — assumed horizontal FOV for uncalibrated images.
+* `GEOM_MAX_DEPTH_M`, `GEOM_RANSAC_*`, `GEOM_MIN_GROUND_PX` — plane-fitting
+  robustness knobs (the 30 m depth cap follows the GroundNet paper, Sec. 5.4).
 
 ---
 

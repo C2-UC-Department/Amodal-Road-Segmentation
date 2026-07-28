@@ -87,7 +87,11 @@ def main() -> None:
             n_skipped_existing += 1
             continue  # never clobber a hand-corrected (or previously seeded) mask
 
-        ofrs_road = predict.predict_amodal(ofrsnet, sem, device, threshold=args.threshold)
+        geo_fields = (predict.compute_geometry(rgb, sem, s.base, device)
+                      if ofrsnet.use_geometry else None)
+        ofrs_road = predict.predict_amodal(ofrsnet, sem, device,
+                                           threshold=args.threshold,
+                                           geo_fields=geo_fields)
         final, _patch = predict.compose_amodal_mask(sem, ofrs_road)
         common.write_mask(amodal_path, final)
         n_seeded += 1

@@ -39,6 +39,7 @@ import config  # noqa: E402
 from src import common  # noqa: E402
 from src import s3_detect_foreground as s3  # noqa: E402
 from src import s5_export_semantics as s5  # noqa: E402
+from src import geometry as geo  # noqa: E402
 from src.ofrs.model import OFRSNet  # noqa: E402
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -58,22 +59,87 @@ def list_images(root: Path) -> list[Path]:
 
 
 def load_ofrsnet(ckpt_path: Path, device):
-    model = OFRSNet(in_channels=config.OFRS_NUM_CLASSES, num_classes=2).to(device)
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device)
+        # Rebuild the architecture the checkpoint was trained with, so a
+        # geometry-trained model is never silently loaded as semantic-only.
+        use_geo = bool(ckpt.get("use_geometry", False))
+        model = OFRSNet(in_channels=config.OFRS_NUM_CLASSES, num_classes=2,
+                        use_geometry=use_geo).to(device)
         model.load_state_dict(ckpt["model"])
         print(f"[ckpt] loaded {ckpt_path}  (epoch {ckpt.get('epoch','?')}, "
-              f"val_road_IoU {ckpt.get('val_iou','?')})")
+              f"val_road_IoU {ckpt.get('val_iou','?')}, geometry={use_geo})")
     else:
+        model = OFRSNet(in_channels=config.OFRS_NUM_CLASSES, num_classes=2).to(device)
         print(f"[warn] no checkpoint at {ckpt_path}; using RANDOM weights "
               "(train OFRSNet first for meaningful output).")
     model.eval()
     return model
 
 
+def compute_geometry(rgb: np.ndarray, sem: np.ndarray, base: str, device):
+    """Ground-manifold fields for one image, as model-ready tensors.
+
+    Prefers the Step-7 cache; falls back to computing depth on the fly for
+    images that were never precomputed (e.g. a brand-new photo). Returns None
+    if geometry is unavailable or the plane fit fails -- the model then falls
+    back to semantic-only behaviour for that image.
+    """
+    fields = geo.load_ground_fields(base, out_hw=sem.shape)
+    if fields is None:
+        h_img, w_img = sem.shape
+        K, _ = geo.intrinsics_for_sample(base, w_img, h_img,
+                                         orig_w=rgb.shape[1], orig_h=rgb.shape[0])
+        rgb_small = (rgb if rgb.shape[:2] == sem.shape else
+                     cv2.resize(rgb, (w_img, h_img), interpolation=cv2.INTER_AREA))
+        depth = geo.estimate_depth_metric(rgb_small, device)
+        ground = sem == ROAD_IDX
+        if int(ground.sum()) < config.GEOM_MIN_GROUND_PX:
+            return None
+        n_plane, _ = geo.estimate_ground_plane(depth, ground, K)
+        if n_plane is None:
+            return None
+        G, hh, gvalid = geo.derive_ground_fields(depth, n_plane, K)
+        fields = dict(G=G, h=hh, gvalid=gvalid, valid=True)
+    if not fields["valid"]:
+        return None
+    # Return raw numpy at NATIVE resolution; predict_amodal resizes and pads it
+    # through exactly the same path as the semantic map so the two stay aligned.
+    return fields
+
+
+def _geo_to_tensors(fields, small_hw, padded_hw, device):
+    """Resize native-resolution geometry to the capped size, pad it to the
+    network canvas, and convert to tensors.
+
+    Must mirror `fit_within_max_side` + `pad_to_multiple` exactly, or the
+    geometry would be spatially offset from the semantic features it gates.
+    Padding sets gvalid=0, so padded pixels can never act as attention keys.
+    """
+    if fields is None:
+        return None
+    sh, sw = small_hw
+    ph, pw = padded_hw
+    G = cv2.resize(fields["G"], (sw, sh), interpolation=cv2.INTER_LINEAR)
+    h_f = cv2.resize(fields["h"], (sw, sh), interpolation=cv2.INTER_LINEAR)
+    gv = cv2.resize(fields["gvalid"].astype(np.uint8), (sw, sh),
+                    interpolation=cv2.INTER_NEAREST)
+
+    Gp = np.zeros((ph, pw, 3), np.float32); Gp[:sh, :sw] = G
+    hp = np.zeros((ph, pw), np.float32);    hp[:sh, :sw] = h_f
+    vp = np.zeros((ph, pw), np.float32);    vp[:sh, :sw] = gv
+
+    return {
+        "G": torch.from_numpy(Gp.transpose(2, 0, 1))[None].to(device),
+        "h": torch.from_numpy(hp)[None, None].to(device),
+        "gvalid": (torch.from_numpy(vp)[None, None] > 0.5).to(device),
+        "valid": torch.tensor([True], device=device),
+    }
+
+
 @torch.no_grad()
 def predict_amodal(model, sem_labels: np.ndarray, device,
-                   threshold: float = 0.5) -> np.ndarray:
+                   threshold: float = 0.5, geo_fields=None) -> np.ndarray:
     """sem_labels (H,W) int 0..10, at NATIVE resolution -> predicted amodal
     road mask, same (H,W), bool.
 
@@ -101,7 +167,8 @@ def predict_amodal(model, sem_labels: np.ndarray, device,
     x = torch.from_numpy(onehot).unsqueeze(0).to(device)
 
     h, w = sem_small.shape
-    logits = model(x)                                    # (1, 2, H', W') padded
+    geo_t = _geo_to_tensors(geo_fields, (h, w), sem_padded.shape, device)
+    logits = model(x, geo_t)                             # (1, 2, H', W') padded
     prob_road = F.softmax(logits, dim=1)[:, 1:2, :h, :w]  # crop padding off -> (1,1,h,w)
 
     if scale < 1.0:
@@ -199,7 +266,10 @@ def main() -> None:
         image = Image.fromarray(rgb)
         seg = s3.segment(processor, model_m2f, device, image)      # mapillary ids
         sem = lut[np.clip(seg, 0, len(lut) - 1)]                    # OFRS 0..10
-        ofrs_road = predict_amodal(ofrsnet, sem, device, threshold=args.threshold)
+        geo_fields = (compute_geometry(rgb, sem, path.stem, device)
+                      if ofrsnet.use_geometry else None)
+        ofrs_road = predict_amodal(ofrsnet, sem, device, threshold=args.threshold,
+                                   geo_fields=geo_fields)
         amodal, patch = compose_amodal_mask(sem, ofrs_road)
 
         common.write_mask(out_dir / "mask" / f"{path.stem}.png", amodal)

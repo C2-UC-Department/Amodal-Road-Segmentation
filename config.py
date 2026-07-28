@@ -164,3 +164,61 @@ OFRS_SPLIT_SEED = 1234
 OFRS_EPOCHS = 80
 OFRS_BATCH_SIZE = 4
 OFRS_LR = 1e-3
+
+# --------------------------------------------------------------------------- #
+# Geometry stream (GroundNet-derived) -- the "ground manifold" signal
+# --------------------------------------------------------------------------- #
+# Reformulation: road completion as message passing on a ground manifold.
+# Mask2Former says WHAT each visible pixel is; this stream says WHERE the road
+# surface is in 3D, so the context module can propagate semantic evidence
+# preferentially between pixels that share a ground surface.
+#
+# We implement GroundNet's DEPTH stream (Man et al., ICCV-W 2019, Eq. 1-5):
+# monocular depth -> unproject ground pixels -> RANSAC plane fit -> normal n.
+# GroundNet's second (surface-normal) stream needs Marigold/`diffusers`, which
+# is not installed; it is optional here (see src/geometry.py). Per the paper's
+# own ablation (Table 4) the depth+RANSAC stream is the stronger of the two
+# individually (2.92 deg vs 6.73 deg on KITTI 5/0.05), so depth-only is a
+# defensible default -- but it IS a reduction from the full paper method.
+GEOMETRY_DIR = PROC_DIR / "geometry"
+
+# Monocular metric depth model (outdoor). Small = fast enough to precompute.
+DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
+
+# Plane fitting (paper Sec. 5.4: "valid depth threshold ... 30m").
+GEOM_MAX_DEPTH_M = 30.0
+GEOM_RANSAC_THRESH_M = 0.05
+GEOM_RANSAC_ITERS = 500
+GEOM_MIN_GROUND_PX = 500      # below this, the plane fit is not trustworthy
+
+# Camera intrinsics. KITTI ships real calibration (calib/*.txt, P2 = the
+# rectified colour camera that produces image_2) and we parse it. Arbitrary
+# phone photos have NO intrinsics, so we fall back to an assumed horizontal
+# FOV -- a standard approximation, but a genuine source of error the paper
+# never faced (it evaluated only on calibrated KITTI/ApolloScape).
+GEOM_FALLBACK_HFOV_DEG = 65.0
+
+# Clamp on the ground-footprint distance (metres). Rays near the horizon
+# intersect the plane arbitrarily far away; without a cap the pairwise
+# distance term blows up and swamps the softmax.
+GEOM_MAX_GROUND_DIST_M = 60.0
+
+# --------------------------------------------------------------------------- #
+# Multimodal (geometry-guided) context module
+# --------------------------------------------------------------------------- #
+# Tier 1: ground-weighted global pooling. Pixels are weighted by
+#   exp(-|h| / tau_h), h = signed height above the fitted ground plane, so the
+#   pooled "global context" summarises the road surface instead of averaging
+#   in cars, buildings and sky.
+# Tier 2: geometry-gated non-local attention. Query i attends to key j with
+#   logit  <q_i,k_j>/sqrt(d)  -  alpha * ( ||G_i - G_j||^2 / tau_d + |h_j| / tau_h )
+#   where G is each pixel's GROUND FOOTPRINT (where its viewing ray meets the
+#   plane). Using G rather than the pixel's own 3D point is what makes this
+#   work for amodal completion: a pixel on a car roof is far off-manifold, but
+#   its footprint is exactly the road location it occludes, so it still gathers
+#   evidence from the right neighbourhood.
+OFRS_USE_GEOMETRY = True       # master switch; False = original semantic-only module
+OFRS_ATTN_DIM = 64             # query/key dim for the non-local block
+OFRS_ATTN_KV_STRIDE = 4        # pool keys/values by this factor (cost: N x N/stride^2)
+OFRS_TAU_H_INIT = 0.5          # metres; manifold-membership softness
+OFRS_TAU_D_INIT = 25.0         # metres^2; ground-plane neighbourhood (~5 m)

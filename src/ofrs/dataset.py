@@ -34,6 +34,7 @@ from torch.utils.data import Dataset
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import config  # noqa: E402
 from src import common  # noqa: E402
+from src import geometry as geomod  # noqa: E402
 
 
 def annotated_bases() -> list[str]:
@@ -123,10 +124,29 @@ class OFRSDataset(Dataset):
 
         weight = build_weight_map(amodal)
 
+        # --- ground-manifold geometry (optional; Step 7) ---
+        hgt, wid = amodal.shape
+        fields = (geomod.load_ground_fields(base, out_hw=(hgt, wid))
+                  if config.OFRS_USE_GEOMETRY else None)
+        if fields is None or not fields["valid"]:
+            G = np.zeros((3, hgt, wid), np.float32)
+            hfield = np.zeros((1, hgt, wid), np.float32)
+            gvalid = np.zeros((1, hgt, wid), np.float32)
+            geo_valid = False
+        else:
+            G = fields["G"].transpose(2, 0, 1).astype(np.float32)
+            hfield = fields["h"][None].astype(np.float32)
+            gvalid = fields["gvalid"][None].astype(np.float32)
+            geo_valid = True
+
         return (
             torch.from_numpy(onehot),                       # (C, h, w) float32
             torch.from_numpy(amodal.astype(np.int64)),      # (h, w) int64
             torch.from_numpy(weight),                       # (h, w) float32
+            torch.from_numpy(G),                            # (3, h, w) float32
+            torch.from_numpy(hfield),                       # (1, h, w) float32
+            torch.from_numpy(gvalid),                       # (1, h, w) float32
+            torch.tensor(geo_valid),                        # scalar bool
             base,
         )
 
@@ -142,7 +162,7 @@ def ofrs_collate(batch):
     for the loss weight, so collate-padding never contributes to gradients.
     Returns an extra `valid` mask (weight > 0) for masking evaluation metrics.
     """
-    onehots, targets, weights, bases = zip(*batch)
+    onehots, targets, weights, Gs, hs, gvalids, geo_valids, bases = zip(*batch)
     n, c = len(batch), onehots[0].shape[0]
     s = config.OFRS_NET_STRIDE
 
@@ -155,12 +175,22 @@ def ofrs_collate(batch):
     batch_onehot[:, config.OFRS_UNLABELED_ID, :, :] = 1.0
     batch_target = torch.zeros(n, max_h, max_w, dtype=torch.int64)
     batch_weight = torch.zeros(n, max_h, max_w, dtype=torch.float32)
+    batch_G = torch.zeros(n, 3, max_h, max_w, dtype=torch.float32)
+    batch_h = torch.zeros(n, 1, max_h, max_w, dtype=torch.float32)
+    # gvalid pads with 0 => padded pixels are never usable as attention keys.
+    batch_gvalid = torch.zeros(n, 1, max_h, max_w, dtype=torch.float32)
 
     for i in range(n):
         h, w = targets[i].shape
         batch_onehot[i, :, :h, :w] = onehots[i]
         batch_target[i, :h, :w] = targets[i]
         batch_weight[i, :h, :w] = weights[i]
+        batch_G[i, :, :h, :w] = Gs[i]
+        batch_h[i, :, :h, :w] = hs[i]
+        batch_gvalid[i, :, :h, :w] = gvalids[i]
+
+    geo = dict(G=batch_G, h=batch_h, gvalid=batch_gvalid > 0.5,
+               valid=torch.stack([torch.as_tensor(v) for v in geo_valids]))
 
     valid = batch_weight > 0
-    return batch_onehot, batch_target, batch_weight, valid, list(bases)
+    return batch_onehot, batch_target, batch_weight, valid, geo, list(bases)
