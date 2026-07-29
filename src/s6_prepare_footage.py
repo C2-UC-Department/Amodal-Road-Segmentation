@@ -87,7 +87,8 @@ def main() -> None:
             n_skipped_existing += 1
             continue  # never clobber a hand-corrected (or previously seeded) mask
 
-        geo_fields = (predict.compute_geometry(rgb, sem, s.base, device)
+        geo_fields = (predict.compute_geometry(rgb, sem, s.base, device,
+                                              image_path=s.image_path)
                       if ofrsnet.use_geometry else None)
         ofrs_road = predict.predict_amodal(ofrsnet, sem, device,
                                            threshold=args.threshold,

@@ -77,7 +77,8 @@ def load_ofrsnet(ckpt_path: Path, device):
     return model
 
 
-def compute_geometry(rgb: np.ndarray, sem: np.ndarray, base: str, device):
+def compute_geometry(rgb: np.ndarray, sem: np.ndarray, base: str, device,
+                     image_path: Path | None = None):
     """Ground-manifold fields for one image, as model-ready tensors.
 
     Prefers the Step-7 cache; falls back to computing depth on the fly for
@@ -88,18 +89,20 @@ def compute_geometry(rgb: np.ndarray, sem: np.ndarray, base: str, device):
     fields = geo.load_ground_fields(base, out_hw=sem.shape)
     if fields is None:
         h_img, w_img = sem.shape
-        K, _ = geo.intrinsics_for_sample(base, w_img, h_img,
-                                         orig_w=rgb.shape[1], orig_h=rgb.shape[0])
+        cal = geo.calibrate_sample(image_path, base, w_img, h_img,
+                                   orig_w=rgb.shape[1], orig_h=rgb.shape[0],
+                                   device=device)
         rgb_small = (rgb if rgb.shape[:2] == sem.shape else
                      cv2.resize(rgb, (w_img, h_img), interpolation=cv2.INTER_AREA))
         depth = geo.estimate_depth_metric(rgb_small, device)
         ground = sem == ROAD_IDX
         if int(ground.sum()) < config.GEOM_MIN_GROUND_PX:
             return None
-        n_plane, _ = geo.estimate_ground_plane(depth, ground, K)
+        n_plane, _info = geo.estimate_ground_plane(depth, ground, cal.K,
+                                                   gravity=cal.gravity)
         if n_plane is None:
             return None
-        G, hh, gvalid = geo.derive_ground_fields(depth, n_plane, K)
+        G, hh, gvalid = geo.derive_ground_fields(depth, n_plane, cal.K)
         fields = dict(G=G, h=hh, gvalid=gvalid, valid=True)
     if not fields["valid"]:
         return None
@@ -266,7 +269,7 @@ def main() -> None:
         image = Image.fromarray(rgb)
         seg = s3.segment(processor, model_m2f, device, image)      # mapillary ids
         sem = lut[np.clip(seg, 0, len(lut) - 1)]                    # OFRS 0..10
-        geo_fields = (compute_geometry(rgb, sem, path.stem, device)
+        geo_fields = (compute_geometry(rgb, sem, path.stem, device, image_path=path)
                       if ofrsnet.use_geometry else None)
         ofrs_road = predict_amodal(ofrsnet, sem, device, threshold=args.threshold,
                                    geo_fields=geo_fields)

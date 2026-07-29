@@ -37,6 +37,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config  # noqa: E402
+from src import calibration  # noqa: E402
 
 _MODELS: dict = {}
 
@@ -44,55 +45,19 @@ _MODELS: dict = {}
 # --------------------------------------------------------------------------- #
 # Camera intrinsics
 # --------------------------------------------------------------------------- #
-def intrinsics_from_fov(w: int, h: int,
-                        hfov_deg: float = config.GEOM_FALLBACK_HFOV_DEG) -> np.ndarray:
-    """Assumed-FOV pinhole intrinsics, for images with no calibration."""
-    f = (w / 2.0) / np.tan(np.radians(hfov_deg) / 2.0)
-    return np.array([[f, 0, w / 2.0],
-                     [0, f, h / 2.0],
-                     [0, 0, 1.0]], dtype=np.float64)
+# Intrinsics estimation lives in src/calibration.py (KITTI calib -> GeoCalib ->
+# EXIF -> assumed FOV). These are thin re-exports so callers and older code
+# keep working.
+intrinsics_from_fov = calibration.K_from_fov
+scale_intrinsics = calibration.scale_K
 
 
-def read_kitti_intrinsics(calib_path: Path) -> np.ndarray | None:
-    """Parse K from a KITTI calib file.
-
-    `image_2` is the rectified LEFT COLOUR camera, whose projection matrix is
-    P2; its upper-left 3x3 block is the intrinsic matrix.
-    """
-    try:
-        for line in calib_path.read_text().splitlines():
-            if line.startswith("P2:"):
-                vals = [float(v) for v in line.split()[1:]]
-                return np.array(vals, dtype=np.float64).reshape(3, 4)[:, :3]
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
-def intrinsics_for_sample(base: str, w: int, h: int,
-                          orig_w: int | None = None,
-                          orig_h: int | None = None) -> tuple[np.ndarray, bool]:
-    """Return (K, is_calibrated) for a sample, scaled to a (w, h) image.
-
-    KITTI bases get real calibration; anything else falls back to assumed FOV.
-    """
-    calib = config.KITTI_ROOT / config.SPLIT / "calib" / f"{base}.txt"
-    K = read_kitti_intrinsics(calib) if calib.exists() else None
-    if K is None:
-        return intrinsics_from_fov(w, h), False
-    # K is defined for the ORIGINAL image size; rescale if we resized.
-    if orig_w and orig_h and (orig_w != w or orig_h != h):
-        K = K.copy()
-        K[0, :] *= w / orig_w
-        K[1, :] *= h / orig_h
-    return K, True
-
-
-def scale_intrinsics(K: np.ndarray, sx: float, sy: float) -> np.ndarray:
-    K = K.copy().astype(np.float64)
-    K[0, :] *= sx
-    K[1, :] *= sy
-    return K
+def calibrate_sample(image_path, base: str | None, w: int, h: int,
+                     orig_w: int | None = None, orig_h: int | None = None,
+                     device=None) -> calibration.Calibration:
+    """Best-available intrinsics (+ gravity when GeoCalib supplies it)."""
+    return calibration.calibrate(image_path, base, w, h,
+                                 orig_w=orig_w, orig_h=orig_h, device=device)
 
 
 # --------------------------------------------------------------------------- #
@@ -236,17 +201,69 @@ def canonical_unit_normal(n: np.ndarray | None) -> np.ndarray | None:
     return -u if u[1] > 0 else u
 
 
-def estimate_ground_plane(depth, ground_mask, K, seed=0):
-    """Full depth stream: returns (n, n_points_used). n is None on failure.
+def fit_plane_with_up_prior(points: np.ndarray, up: np.ndarray) -> np.ndarray | None:
+    """Fit only the plane OFFSET, with the normal direction fixed by `up`.
 
-    `n` uses the `n . X = 1` parameterisation (Eq. 4-5) with its sign determined
-    by the fit -- see `canonical_unit_normal` for why we must not "canonicalise"
-    it here.
+    A 1-DOF fit instead of 3-DOF. When the normal direction comes from an
+    independent, reliable source (GeoCalib's gravity), this is far more robust
+    than a free fit on noisy monocular depth -- especially when only a small
+    strip of road is visible, where a free RANSAC fit can latch onto a wrong
+    surface entirely.
+
+    Plane: u . X = c, solved robustly with the median; returned in the project's
+    `n . X = 1` form as n = u / c (which also fixes the sign automatically).
     """
+    points = np.asarray(points, dtype=np.float64)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) < 3:
+        return None
+    u = np.asarray(up, dtype=np.float64)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    c = float(np.median(np.einsum("nc,c->n", points, u)))
+    if abs(c) < 1e-6:
+        return None
+    return u / c
+
+
+def estimate_ground_plane(depth, ground_mask, K, seed=0, gravity=None):
+    """Depth-stream ground plane, optionally cross-checked against gravity.
+
+    Returns (n, info) where `n` uses the `n . X = 1` parameterisation (Eq. 4-5)
+    with its sign determined by the fit -- see `canonical_unit_normal` for why
+    we must not "canonicalise" it here -- and `info` records which estimate was
+    used and how well the two streams agreed.
+
+    With `gravity` supplied (from GeoCalib), this implements GroundNet's
+    two-stream idea with a genuinely independent second stream: the free depth
+    fit and the gravity direction are compared (Eq. 11), and if they disagree
+    by more than config.GEOM_GRAVITY_MAX_ANGLE_DEG the depth fit is rejected in
+    favour of the gravity-constrained fit.
+    """
+    info = {"n_points": 0, "mode": "none", "consistency_deg": float("nan")}
     pts = unproject_ground_points(depth, ground_mask, K)
+    info["n_points"] = len(pts)
     if len(pts) < 3:
-        return None, 0
-    return fit_plane_ransac(pts, seed=seed), len(pts)
+        return None, info
+
+    n_free = fit_plane_ransac(pts, seed=seed)
+
+    if gravity is None:
+        info["mode"] = "depth_ransac"
+        return n_free, info
+
+    n_prior = fit_plane_with_up_prior(pts, gravity)
+    if n_free is None:
+        info["mode"] = "gravity_prior"
+        return n_prior, info
+
+    ang = consistency_angle_deg(canonical_unit_normal(n_free),
+                               canonical_unit_normal(gravity))
+    info["consistency_deg"] = ang
+    if np.isfinite(ang) and ang > config.GEOM_GRAVITY_MAX_ANGLE_DEG and n_prior is not None:
+        info["mode"] = "gravity_prior"      # depth fit disagrees -> distrust it
+        return n_prior, info
+    info["mode"] = "depth_ransac"           # streams agree -> keep the free fit
+    return n_free, info
 
 
 # --------------------------------------------------------------------------- #
@@ -336,7 +353,9 @@ def geometry_path(base: str) -> Path:
 
 
 def save_geometry(base: str, depth, n, K, calibrated: bool,
-                  n_ground_pts: int, consistency_deg: float = float("nan")) -> None:
+                  n_ground_pts: int, consistency_deg: float = float("nan"),
+                  k_source: str = "unknown", gravity=None,
+                  plane_mode: str = "unknown") -> None:
     config.GEOMETRY_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         geometry_path(base),
@@ -347,15 +366,26 @@ def save_geometry(base: str, depth, n, K, calibrated: bool,
         calibrated=np.array(bool(calibrated)),
         n_ground_pts=np.array(int(n_ground_pts)),
         consistency_deg=np.array(float(consistency_deg), np.float32),
+        # Provenance: which intrinsics source was used, whether gravity was
+        # available, and which plane estimate won. Recorded so a cache built
+        # with a weak source can be spotted and re-exported later.
+        k_source=np.array(str(k_source)),
+        gravity=(np.zeros(3) if gravity is None else np.asarray(gravity)).astype(np.float32),
+        has_gravity=np.array(gravity is not None),
+        plane_mode=np.array(str(plane_mode)),
     )
 
 
 def load_geometry(base: str):
-    """Return dict with depth/n/K/valid, or None if not precomputed."""
+    """Return dict with depth/n/K/valid + provenance, or None if not cached."""
     p = geometry_path(base)
     if not p.exists():
         return None
     z = np.load(p)
+
+    def _opt(key, default):
+        return z[key] if key in z.files else default
+
     return dict(
         depth=z["depth"].astype(np.float32),
         n=z["n"].astype(np.float64),
@@ -364,6 +394,10 @@ def load_geometry(base: str):
         calibrated=bool(z["calibrated"]),
         n_ground_pts=int(z["n_ground_pts"]),
         consistency_deg=float(z["consistency_deg"]),
+        k_source=str(_opt("k_source", "unknown")),
+        gravity=(np.asarray(_opt("gravity", np.zeros(3)), np.float64)
+                 if bool(_opt("has_gravity", False)) else None),
+        plane_mode=str(_opt("plane_mode", "unknown")),
     )
 
 

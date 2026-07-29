@@ -67,9 +67,18 @@ def main() -> None:
         samples = samples[: args.limit]
 
     n_ok = n_fail = n_skip = 0
+    src_counts: dict[str, int] = {}
+    mode_counts: dict[str, int] = {}
+    consistencies: list[float] = []
+    n_stale = 0
     for s in tqdm(samples, desc="geometry export"):
         if geo.geometry_path(s.base).exists() and not args.overwrite:
             n_skip += 1
+            # Flag caches built before/without a real calibration source, so a
+            # stale heuristic-K entry is never silently reused.
+            cached = geo.load_geometry(s.base)
+            if cached is not None and cached.get("k_source") in ("unknown", "fov_prior"):
+                n_stale += 1
             continue
 
         sem_path = config.SEMANTIC_DIR / f"{s.base}.png"
@@ -90,8 +99,10 @@ def main() -> None:
         else:
             rgb_small = rgb
 
-        K, calibrated = geo.intrinsics_for_sample(s.base, w_img, h_img,
-                                                  orig_w=orig_w, orig_h=orig_h)
+        cal = geo.calibrate_sample(s.image_path, s.base, w_img, h_img,
+                                   orig_w=orig_w, orig_h=orig_h, device=device)
+        K, calibrated = cal.K, cal.calibrated
+        src_counts[cal.source] = src_counts.get(cal.source, 0) + 1
 
         depth = geo.estimate_depth_metric(rgb_small, device)
         ground = small == ROAD_IDX
@@ -100,12 +111,21 @@ def main() -> None:
             # Too little visible road to trust a plane fit -- cache an
             # explicitly invalid entry so training falls back cleanly rather
             # than silently consuming a garbage plane.
-            geo.save_geometry(s.base, depth, None, K, calibrated, int(ground.sum()))
+            geo.save_geometry(s.base, depth, None, K, calibrated,
+                              int(ground.sum()), k_source=cal.source,
+                              gravity=cal.gravity)
             n_fail += 1
             continue
 
-        n_plane, n_pts = geo.estimate_ground_plane(depth, ground, K)
-        geo.save_geometry(s.base, depth, n_plane, K, calibrated, n_pts)
+        n_plane, info = geo.estimate_ground_plane(depth, ground, K,
+                                                  gravity=cal.gravity)
+        geo.save_geometry(s.base, depth, n_plane, K, calibrated,
+                          info["n_points"], consistency_deg=info["consistency_deg"],
+                          k_source=cal.source, gravity=cal.gravity,
+                          plane_mode=info["mode"])
+        mode_counts[info["mode"]] = mode_counts.get(info["mode"], 0) + 1
+        if np.isfinite(info["consistency_deg"]):
+            consistencies.append(info["consistency_deg"])
         if n_plane is None:
             n_fail += 1
         else:
@@ -119,6 +139,21 @@ def main() -> None:
 
     print(f"[ok] plane fitted for {n_ok} images "
           f"({n_fail} failed/insufficient road, {n_skip} already cached)")
+    if src_counts:
+        print("[intrinsics] source used: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(src_counts.items())))
+    if mode_counts:
+        print("[plane] estimate used:    "
+              + ", ".join(f"{k}={v}" for k, v in sorted(mode_counts.items())))
+    if consistencies:
+        c = np.array(consistencies)
+        print(f"[consistency] depth-plane vs gravity (GroundNet Eq.11): "
+              f"median {np.median(c):.2f} deg, p90 {np.percentile(c, 90):.2f} deg, "
+              f"max {c.max():.2f} deg")
+    if n_stale:
+        print(f"[stale] {n_stale} cached entries were built with a heuristic/unknown "
+              f"focal length.\n        Re-run with --overwrite to recompute them "
+              f"with the current calibration chain.")
     print(f"     -> {config.GEOMETRY_DIR}")
 
 

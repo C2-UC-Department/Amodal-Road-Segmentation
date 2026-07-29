@@ -240,19 +240,72 @@ Toggle the whole thing with `config.OFRS_USE_GEOMETRY`; checkpoints record
 which architecture they were trained with, so `predict.py` always rebuilds a
 matching model.
 
+### Camera intrinsics (`src/calibration.py`)
+
+Every 3D quantity is back-projected through **K**, so a wrong focal length does
+not merely rescale the reconstruction — it *shears* it (X and Y scale
+differently from Z), tilting the fitted plane and corrupting the relative
+geometry the gate depends on. Since users run this on arbitrary cameras, K is
+resolved through a fallback chain, and the source actually used is recorded in
+each geometry cache:
+
+| Priority | Source | Notes |
+|---|---|---|
+| 1 | `kitti_calib` | Exact per-image calibration (`calib/*.txt`, `P2`) |
+| 2 | `geocalib` | [GeoCalib](https://github.com/cvg/GeoCalib) (ECCV 2024) — learned focal length **and gravity** |
+| 3 | `exif` | `FocalLengthIn35mmFilm` etc. Free, but ffmpeg strips it from extracted video frames |
+| 4 | `fov_prior` | Blind 65° assumption — last resort |
+
+**Measured on this project's own footage, the blind prior was 35–45% wrong**
+(true hfov ≈ 39–45°, not 65°). GeoCalib is an optional dependency:
+
+```bash
+pip install "git+https://github.com/cvg/GeoCalib.git"
+```
+
+Everything degrades gracefully without it. GeoCalib is mildly non-deterministic
+(~0.5% run-to-run on focal length), which is another reason K is **cached** per
+image by Step 6c — each image then always trains with one fixed K.
+
+### Gravity as GroundNet's second stream
+
+GeoCalib also returns a **gravity direction**, which is an estimate of the
+ground-plane normal that is entirely independent of the depth stream. That
+restores the two-stream design GroundNet is built around (the paper's second
+stream needs Marigold, which is not installed here):
+
+* **Consistency check** — the angle between the free depth-RANSAC normal and
+  gravity is exactly the paper's Eq. 11. Measured on our footage:
+  **median 3.22°, p90 4.49°, max 5.67°** — two independent methods agreeing
+  tightly, which validates both.
+* **Robust fallback** — if they disagree by more than
+  `config.GEOM_GRAVITY_MAX_ANGLE_DEG` (15°), the depth fit is distrusted and we
+  use a **gravity-constrained fit** instead: the normal direction is fixed by
+  gravity and only the plane *offset* is estimated from depth (1-DOF instead of
+  3-DOF). This matters when only a thin strip of road is visible, where a free
+  RANSAC fit can lock onto the wrong surface entirely.
+
+Both the source and which plane estimate won are stored (`k_source`,
+`plane_mode`, `consistency_deg`), and `python -m src.s7_export_geometry` prints
+a summary. It also **warns when cached entries were built with a heuristic K**
+so a stale cache is never silently reused — re-run with `--overwrite` to fix.
+
 ### Honest caveats
 
-* **Depth stream only.** GroundNet's second (surface-normal) stream and its
-  geometric-consistency loss need `diffusers`/Marigold, which is not installed.
-  Per the paper's own ablation (Table 4) depth+RANSAC is the stronger single
-  stream (2.92° vs 6.73° on KITTI), so this captures most of the benefit — but
-  it *is* a reduction from the full published method.
-* **Uncalibrated photos have guessed intrinsics.** KITTI ships real calibration
-  (`calib/*.txt`, `P2`); arbitrary phone photos do not, so we assume a 65°
-  horizontal FOV. Absolute metric scale is then unreliable (our footage implies
-  a ~7 m camera height, which is clearly wrong), but the scale error is
-  *uniform*, so relative co-planarity — the thing the gate actually uses —
-  survives, and the learnable `τ` values absorb the rest.
+* **Depth stream only for the normal *magnitude*.** GroundNet's surface-normal
+  stream (Marigold/`diffusers`) is still not installed; gravity now supplies an
+  independent normal *direction*, but not a second depth estimate. Per the
+  paper's ablation (Table 4) depth+RANSAC is the stronger single stream
+  (2.92° vs 6.73° on KITTI), so this captures most of the benefit.
+* **Monocular depth has a systematic scale error, independent of K.** On KITTI,
+  where intrinsics are *exact*, the implied camera height is **2.71 m vs the
+  true ~1.65 m** — a ~1.64× overestimate coming from
+  Depth-Anything-V2-Metric-Outdoor, not from calibration. This is benign for
+  this architecture: a *uniform* scale error rescales `h` and `G` together, and
+  the learnable `τ_h` / `τ_d` absorb it exactly, while relative co-planarity
+  (what the gate actually uses) is untouched. It would matter if you consumed
+  these values as true metres — e.g. for a metric BEV — so treat absolute
+  distances as uncalibrated.
 * **Unproven for this task.** The mechanism is verified to behave as designed
   (see the tests), but whether it *improves road completion* is an open
   empirical question. Train with `OFRS_USE_GEOMETRY = False` and `True` and

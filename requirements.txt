@@ -12,3 +12,13 @@ torch>=2.2
 torchvision>=0.17
 transformers>=4.40
 accelerate>=0.29
+
+# --- Optional: single-image camera calibration -----------------------------
+# GeoCalib (ECCV 2024) estimates focal length AND gravity direction from one
+# image. Without it the pipeline falls back to EXIF and then to a blind FOV
+# assumption, which on real phone footage misestimates the focal length by
+# 35-45% and shears the reconstructed 3D geometry. Not on PyPI, so install
+# from git:
+#     pip install "git+https://github.com/cvg/GeoCalib.git"
+# Code Apache-2.0, pretrained weights CC-BY-4.0. Everything degrades
+# gracefully if it is absent (see src/calibration.py).
