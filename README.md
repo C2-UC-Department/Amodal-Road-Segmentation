@@ -267,28 +267,17 @@ Everything degrades gracefully without it. GeoCalib is mildly non-deterministic
 (~0.5% run-to-run on focal length), which is another reason K is **cached** per
 image by Step 6c — each image then always trains with one fixed K.
 
-### Gravity as GroundNet's second stream
+**Scope: GeoCalib supplies K and nothing else.** The ground plane is still
+fitted purely by RANSAC on the depth point cloud, exactly as GroundNet does;
+the model, the training pipeline and the plane estimator are all unchanged.
+Better intrinsics help only by making the unprojected point cloud less sheared.
+(GeoCalib also predicts a gravity direction — it is carried on the result for
+reference but is deliberately **not** used anywhere.)
 
-GeoCalib also returns a **gravity direction**, which is an estimate of the
-ground-plane normal that is entirely independent of the depth stream. That
-restores the two-stream design GroundNet is built around (the paper's second
-stream needs Marigold, which is not installed here):
-
-* **Consistency check** — the angle between the free depth-RANSAC normal and
-  gravity is exactly the paper's Eq. 11. Measured on our footage:
-  **median 3.22°, p90 4.49°, max 5.67°** — two independent methods agreeing
-  tightly, which validates both.
-* **Robust fallback** — if they disagree by more than
-  `config.GEOM_GRAVITY_MAX_ANGLE_DEG` (15°), the depth fit is distrusted and we
-  use a **gravity-constrained fit** instead: the normal direction is fixed by
-  gravity and only the plane *offset* is estimated from depth (1-DOF instead of
-  3-DOF). This matters when only a thin strip of road is visible, where a free
-  RANSAC fit can lock onto the wrong surface entirely.
-
-Both the source and which plane estimate won are stored (`k_source`,
-`plane_mode`, `consistency_deg`), and `python -m src.s7_export_geometry` prints
-a summary. It also **warns when cached entries were built with a heuristic K**
-so a stale cache is never silently reused — re-run with `--overwrite` to fix.
+The intrinsics source is recorded per image as `k_source`, and
+`python -m src.s7_export_geometry` prints a summary and **warns when cached
+entries were built with a heuristic K** so a stale cache is never silently
+reused — re-run with `--overwrite` to fix.
 
 ### Honest caveats
 

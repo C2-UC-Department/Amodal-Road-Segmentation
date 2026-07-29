@@ -98,8 +98,7 @@ def compute_geometry(rgb: np.ndarray, sem: np.ndarray, base: str, device,
         ground = sem == ROAD_IDX
         if int(ground.sum()) < config.GEOM_MIN_GROUND_PX:
             return None
-        n_plane, _info = geo.estimate_ground_plane(depth, ground, cal.K,
-                                                   gravity=cal.gravity)
+        n_plane, _ = geo.estimate_ground_plane(depth, ground, cal.K)
         if n_plane is None:
             return None
         G, hh, gvalid = geo.derive_ground_fields(depth, n_plane, cal.K)

@@ -68,8 +68,6 @@ def main() -> None:
 
     n_ok = n_fail = n_skip = 0
     src_counts: dict[str, int] = {}
-    mode_counts: dict[str, int] = {}
-    consistencies: list[float] = []
     n_stale = 0
     for s in tqdm(samples, desc="geometry export"):
         if geo.geometry_path(s.base).exists() and not args.overwrite:
@@ -112,20 +110,13 @@ def main() -> None:
             # explicitly invalid entry so training falls back cleanly rather
             # than silently consuming a garbage plane.
             geo.save_geometry(s.base, depth, None, K, calibrated,
-                              int(ground.sum()), k_source=cal.source,
-                              gravity=cal.gravity)
+                              int(ground.sum()), k_source=cal.source)
             n_fail += 1
             continue
 
-        n_plane, info = geo.estimate_ground_plane(depth, ground, K,
-                                                  gravity=cal.gravity)
-        geo.save_geometry(s.base, depth, n_plane, K, calibrated,
-                          info["n_points"], consistency_deg=info["consistency_deg"],
-                          k_source=cal.source, gravity=cal.gravity,
-                          plane_mode=info["mode"])
-        mode_counts[info["mode"]] = mode_counts.get(info["mode"], 0) + 1
-        if np.isfinite(info["consistency_deg"]):
-            consistencies.append(info["consistency_deg"])
+        n_plane, n_pts = geo.estimate_ground_plane(depth, ground, K)
+        geo.save_geometry(s.base, depth, n_plane, K, calibrated, n_pts,
+                          k_source=cal.source)
         if n_plane is None:
             n_fail += 1
         else:
@@ -142,14 +133,6 @@ def main() -> None:
     if src_counts:
         print("[intrinsics] source used: "
               + ", ".join(f"{k}={v}" for k, v in sorted(src_counts.items())))
-    if mode_counts:
-        print("[plane] estimate used:    "
-              + ", ".join(f"{k}={v}" for k, v in sorted(mode_counts.items())))
-    if consistencies:
-        c = np.array(consistencies)
-        print(f"[consistency] depth-plane vs gravity (GroundNet Eq.11): "
-              f"median {np.median(c):.2f} deg, p90 {np.percentile(c, 90):.2f} deg, "
-              f"max {c.max():.2f} deg")
     if n_stale:
         print(f"[stale] {n_stale} cached entries were built with a heuristic/unknown "
               f"focal length.\n        Re-run with --overwrite to recompute them "

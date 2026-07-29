@@ -195,7 +195,7 @@ GEOM_MIN_GROUND_PX = 500      # below this, the plane fit is not trustworthy
 # focal length shears the whole ground manifold. Sources are tried in order and
 # the one actually used is recorded in the geometry cache (see src/calibration.py):
 #   kitti_calib -- exact, per-image (KITTI calib/*.txt, P2)
-#   geocalib    -- GeoCalib (ECCV 2024): learned focal length + gravity.
+#   geocalib    -- GeoCalib (ECCV 2024): learned focal length from one image.
 #                  Optional dependency; skipped automatically if not installed.
 #   exif        -- FocalLengthIn35mmFilm etc. Free, but ffmpeg strips it when
 #                  extracting video frames, so footage frames rarely have it.
@@ -204,14 +204,6 @@ GEOM_MIN_GROUND_PX = 500      # below this, the plane fit is not trustworthy
 INTRINSICS_PRIORITY = ["kitti_calib", "geocalib", "exif", "fov_prior"]
 GEOCALIB_WEIGHTS = "pinhole"     # or "distorted" for lens distortion
 GEOM_FALLBACK_HFOV_DEG = 65.0
-
-# GeoCalib's gravity vector is an estimate of the ground-plane normal that is
-# fully INDEPENDENT of the depth stream, so it plays the role of GroundNet's
-# second stream (Eq. 11 geometric consistency). If the free depth-based RANSAC
-# plane normal disagrees with gravity by more than this angle, the depth fit is
-# treated as unreliable and we fall back to a gravity-constrained fit (normal
-# direction fixed by gravity, only the plane offset estimated from depth).
-GEOM_GRAVITY_MAX_ANGLE_DEG = 15.0
 
 # Clamp on the ground-footprint distance (metres). Rays near the horizon
 # intersect the plane arbitrarily far away; without a cap the pairwise

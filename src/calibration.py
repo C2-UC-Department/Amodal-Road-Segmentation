@@ -23,10 +23,11 @@ used:
                     a blind guess and measurably poor -- on our own footage it
                     underestimates the focal length by 35-45%.
 
-GeoCalib additionally returns the **gravity direction**, which is an estimate
-of the ground-plane normal that is completely independent of the depth stream.
-`src/geometry.py` uses it both as GroundNet's geometric-consistency check
-(Eq. 11) and as a robust prior when the depth-based plane fit is unreliable.
+SCOPE: this module estimates K and nothing else. GeoCalib also predicts a
+gravity direction, and it is carried on the result for reference, but nothing
+in the pipeline consumes it -- the ground plane is still fitted purely by
+RANSAC on the depth point cloud, exactly as GroundNet does. Better intrinsics
+improve that fit only by making the point cloud less sheared.
 """
 from __future__ import annotations
 
@@ -46,6 +47,8 @@ _CACHE: dict = {}
 class Calibration:
     K: np.ndarray                  # 3x3, valid for the (w, h) it was built at
     source: str                    # kitti_calib | geocalib | exif | fov_prior
+    # GeoCalib also predicts gravity; kept for reference only -- the plane
+    # fit does not use it (see the module docstring).
     gravity: np.ndarray | None = None      # unit 3-vector, camera frame
     focal_uncertainty: float | None = None  # px, GeoCalib only
 
