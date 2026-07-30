@@ -250,10 +250,78 @@ BEV_RANGE_Z_M = (0.5, 40.0)       # forward extent (z_min > 0: the camera is not
 # KITTI -- see the README caveats), which would inflate any area by that factor
 # SQUARED. Rescaling n to a known camera height corrects the whole metric world
 # and makes BEV_RANGE_* mean actual metres. Areas are always reported both ways.
+#
+# This is the FALLBACK when automatic estimation (below) finds no usable vehicle
+# in the scene -- it is no longer the primary source of the height assumption.
 BEV_CAMERA_HEIGHT_M = 1.65
 # Reject plainly broken plane fits rather than rasterising garbage.
 BEV_MIN_CAMERA_HEIGHT_M = 0.3
 BEV_MAX_CAMERA_HEIGHT_M = 10.0
+
+# --------------------------------------------------------------------------- #
+# Automatic camera-height estimation from detected vehicles (src/instances.py)
+# --------------------------------------------------------------------------- #
+# The single fixed BEV_CAMERA_HEIGHT_M assumption above is badly wrong for
+# unknown cameras -- on our own footage the RANSAC-implied height ranges 2.5-7.7m
+# (median 6.9m), nothing like 1.65m, so forcing every image through that one
+# constant just replaces one error with a different, silent one.
+#
+# Instead: a detected car's ROOF sits a roughly known height above the ground
+# plane, regardless of the vehicle's yaw relative to the camera (unlike its
+# apparent WIDTH, which is view-angle-dependent and unusable for this). The
+# geometry module already computes height-above-plane per pixel (`h` in
+# derive_ground_fields) at the SAME biased scale as the RANSAC-implied camera
+# height, so comparing a car's measured roof height to this prior gives a
+# per-scene correction factor with no new estimation machinery.
+#
+# Validated against KITTI (true camera height ~1.65m, independently documented,
+# not derived from this pipeline): with these thresholds, single-frame estimates
+# were typically within +-12% of ground truth (occasionally worse; not every
+# frame has a qualifying car), pooling across several cars/frames converged much
+# tighter (median correction factor 0.97, i.e. within 3% of the target on
+# average). This is a real improvement over the fixed constant for unknown
+# cameras, NOT a precise measurement -- report the sample count/spread alongside
+# any estimate rather than presenting it as exact.
+VEHICLE_ROOF_HEIGHT_PRIOR_M = {
+    "car": 1.5,      # sedan/hatchback roof height above ground; Cityscapes' "car"
+                      # also catches some taller SUVs, which is the main source of
+                      # residual per-vehicle variance. Deliberately not extended to
+                      # truck/bus/motorcycle yet -- their real height variance is
+                      # much wider, and a bad prior there would hurt more than help.
+}
+SCALE_EST_MIN_SCORE = 0.85        # instance-segmentation confidence floor
+SCALE_EST_MIN_PIXELS = 3000       # rejects small/distant/partially-occluded cars
+SCALE_EST_MIN_MASK_ROWS = 20      # vertical extent floor -- a sliver has no reliable roofline
+SCALE_EST_TOP_FRAC = 0.08         # fraction of the mask's own height treated as "roofline"
+SCALE_EST_MIN_TOP_ROWS = 6        # ...but never fewer than this many rows (small cars)
+SCALE_EST_MIN_ROOF_HEIGHT_M = 0.3  # sanity floor against near-zero/degenerate measurements
+
+# --------------------------------------------------------------------------- #
+# Ground-contact footprint attribution (src/bev.py, src/disturbance.py)
+# --------------------------------------------------------------------------- #
+# Warping a vehicle's ENTIRE mask through the ground-plane homography is only
+# valid for pixels that truly lie on the plane; roofline/hood/windshield pixels
+# do not (see BEV_CAMERA_HEIGHT_M above -- the same "elevated pixels don't
+# project where you'd expect" issue, here affecting WHICH vehicle a shadow cell
+# is attributed to rather than the metric scale). Only a vehicle's BOTTOM
+# CONTOUR is actually near the ground, so attribution seeds are built from that
+# contour alone: projected to BEV, then rasterised into a small band -- not the
+# vehicle's full projected silhouette.
+FOOTPRINT_BAND_WIDTH_M = 0.4        # real-world width of the rasterised contact
+                                     # band -- a tire's contact zone plus a small
+                                     # margin for contour/depth noise; deliberately
+                                     # far short of the vehicle's own body length
+FOOTPRINT_MAX_ATTRIBUTION_DIST_M = 35.0  # safety net, not the primary mechanism --
+                                     # that's the band's shape. Generous enough that
+                                     # a legitimate single-vehicle shadow within the
+                                     # measurable range (25-35m on our own footage)
+                                     # is never truncated by it; exists only to stop
+                                     # a degenerate/erroneous band from claiming
+                                     # implausibly distant cells.
+FOOTPRINT_MIN_COVERAGE = 0.5        # below this fraction of non-truncated contour
+                                     # columns, a vehicle's footprint is likely
+                                     # incomplete (its base is mostly cropped by
+                                     # the frame) -- surfaced as a warning.
 
 # Measurement reliability cap. Ground resolution decays with roughly the CUBE of
 # range, so past some distance one camera pixel is responsible for a large patch

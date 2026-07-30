@@ -304,3 +304,104 @@ def test_warp_preserves_bool_dtype():
     H = bev.homography_bev_to_image(K, n, grid)
     out = bev.warp_to_bev(np.ones((IMG_H, IMG_W), bool), H, grid)
     assert out.dtype == bool and out.any()
+
+
+# --------------------------------------------------------------------------- #
+# Ground-contact footprint attribution
+# --------------------------------------------------------------------------- #
+def test_project_points_to_bev_round_trips_through_H():
+    """project_points_to_bev is the point-wise inverse of H (BEV -> image): going
+    image -> BEV -> (forward through H) -> image must recover the originals."""
+    K, n = _K(), _plane()
+    grid = bev.BevGrid.from_config()
+    H = bev.homography_bev_to_image(K, n, grid)
+
+    img_pts = np.array([[400.0, 600.0], [700.0, 550.0], [900.0, 650.0]])
+    bev_pts = bev.project_points_to_bev(img_pts, H, grid)
+
+    hom = np.concatenate([bev_pts, np.ones((len(bev_pts), 1))], axis=1)
+    back_hom = (H @ hom.T).T
+    back = back_hom[:, :2] / back_hom[:, 2:3]
+    np.testing.assert_allclose(back, img_pts, atol=1e-6)
+
+
+def test_project_points_to_bev_empty_input():
+    K, n = _K(), _plane()
+    grid = bev.BevGrid.from_config()
+    H = bev.homography_bev_to_image(K, n, grid)
+    out = bev.project_points_to_bev(np.zeros((0, 2)), H, grid)
+    assert out.shape == (0, 2)
+
+
+def test_rasterize_footprint_band_has_expected_width():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    # A horizontal line at row 300 so thickness is trivial to read off a column.
+    pts = np.array([[50.0, 300.0], [150.0, 300.0], [250.0, 300.0]])
+    band = bev.rasterize_footprint_band(pts, grid, band_width_m=0.5)
+
+    expected_px = round(0.5 * grid.ppm)          # 10
+    thickness = int(band[:, 150].sum())          # a column the line actually crosses
+    assert abs(thickness - expected_px) <= 2      # cv2 line rendering tolerance
+    assert band[:, 0].sum() == 0, "the band must not bleed outside the drawn segment"
+
+
+def test_rasterize_footprint_band_single_point_is_a_disk():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    band = bev.rasterize_footprint_band(np.array([[100.0, 300.0]]), grid,
+                                        band_width_m=0.5)
+    expected_area = np.pi * (0.5 * grid.ppm / 2) ** 2   # pi r^2, r = width/2
+    assert band.any()
+    assert band.sum() == pytest.approx(expected_area, rel=0.25)
+
+
+def test_rasterize_footprint_band_empty_points():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    band = bev.rasterize_footprint_band(np.zeros((0, 2)), grid, band_width_m=0.5)
+    assert band.shape == grid.shape and not band.any()
+
+
+def test_nearest_label_bev_partitions_like_a_voronoi_diagram():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    seed_ids = np.zeros(grid.shape, np.int32)
+    seed_ids[300, 50] = 1
+    seed_ids[300, 250] = 2          # symmetric around column 150
+
+    out = bev.nearest_label_bev(seed_ids, grid)
+    assert set(np.unique(out)) == {1, 2}
+    assert out[300, 0] == 1 and out[300, -1] == 2
+    # The boundary should fall at the midpoint (column 150), not be skewed to
+    # one side -- this is what makes attribution "nearest body extent" rather
+    # than an arbitrary tie-break.
+    boundary = np.argmax(out[300] == 2)
+    assert abs(boundary - 150) <= 1
+
+
+def test_nearest_label_bev_respects_max_dist_cutoff():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    seed_ids = np.zeros(grid.shape, np.int32)
+    seed_ids[300, 150] = 1
+
+    near = bev.nearest_label_bev(seed_ids, grid, max_dist_m=1.0)
+    far = bev.nearest_label_bev(seed_ids, grid, max_dist_m=None)
+
+    assert near[300, 150] == 1, "the seed's own cell is always labeled"
+    assert near[0, 0] == 0, "far corner must be cut off by a 1m cap"
+    assert far[0, 0] == 1, "with no cap every cell finds the (only) seed"
+
+
+def test_nearest_label_bev_no_seeds_returns_all_zero():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    out = bev.nearest_label_bev(np.zeros(grid.shape, np.int32), grid)
+    assert not out.any()
+
+
+def test_nearest_label_bev_seed_regions_not_just_points():
+    """Seeds can be any shape -- e.g. a rasterised band, not a single pixel."""
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    seed_ids = np.zeros(grid.shape, np.int32)
+    seed_ids[290:310, 40:60] = 1     # a small filled region
+    seed_ids[290:310, 240:260] = 2
+
+    out = bev.nearest_label_bev(seed_ids, grid)
+    assert out[300, 50] == 1 and out[300, 250] == 2
+    assert out[300, 150] in (1, 2)   # midpoint must resolve to one side or the other

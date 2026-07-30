@@ -225,6 +225,101 @@ def bev_validity(H: np.ndarray, grid: BevGrid,
 
 
 # --------------------------------------------------------------------------- #
+# Ground-contact footprint attribution
+#
+# `warp_to_bev` assumes every pixel it warps lies ON the plane -- true for road
+# pixels, false for a vehicle's roof/hood/windshield (up to ~1.5 m above it).
+# Warping those elevated pixels finds where their camera ray would meet the
+# ground PAST the vehicle, smearing its claimed BEV region away from the camera
+# relative to where it actually sits. Only a vehicle's BOTTOM CONTOUR is near
+# the plane and projects reliably, so attribution seeds come from that contour
+# alone: projected to BEV (this function), rasterised into a small band
+# (`rasterize_footprint_band`), then propagated to the rest of the shadow by
+# nearest seed (`nearest_label_bev`).
+# --------------------------------------------------------------------------- #
+def project_points_to_bev(image_points: np.ndarray, H: np.ndarray,
+                          grid: BevGrid) -> np.ndarray:
+    """(N, 2) image (u, v) -> (N, 2) continuous BEV pixel coordinates.
+
+    The point-wise inverse of `homography_bev_to_image` / `warp_to_bev`: H maps
+    BEV -> image, so points go through H^-1. cv2.perspectiveTransform (not raw
+    matrix math) for the same reason `warp_to_bev` uses cv2.warpPerspective --
+    one well-tested primitive for the whole file's coordinate transforms.
+    """
+    image_points = np.asarray(image_points, dtype=np.float64)
+    if len(image_points) == 0:
+        # cv2.perspectiveTransform returns None (not an empty array) for empty
+        # input, which would otherwise crash every caller's .reshape().
+        return np.zeros((0, 2))
+    pts = image_points.reshape(-1, 1, 2)
+    H_inv = np.linalg.inv(np.asarray(H, dtype=np.float64))
+    return cv2.perspectiveTransform(pts, H_inv).reshape(-1, 2)
+
+
+def rasterize_footprint_band(points_bev: np.ndarray, grid: BevGrid,
+                             band_width_m: float) -> np.ndarray:
+    """Draw a vehicle's projected ground-contact contour as a thin BEV band.
+
+    This is the "small ground-footprint region" itself -- a real 2D area
+    anchored at the vehicle's own base, not a bare point cloud, so the boundary
+    `nearest_label_bev` draws between two nearby vehicles is decided by nearest
+    BODY EXTENT rather than nearest sample point.
+
+    `points_bev` must already be in left-to-right column order (as
+    `_bottom_contour_points` produces) so consecutive points form the contour's
+    actual edges, not a random zig-zag. A single point (a contour that collapsed
+    to one usable column) draws as a filled disk instead of a degenerate
+    zero-length line, so it is never silently dropped.
+    """
+    band_px = max(1, int(round(band_width_m * grid.ppm)))
+    canvas = np.zeros(grid.shape, np.uint8)
+    pts = np.round(points_bev).astype(np.int32)
+    if len(pts) == 0:
+        return canvas > 0
+    if len(pts) == 1:
+        cv2.circle(canvas, tuple(pts[0]), max(1, band_px // 2), 1, -1)
+    else:
+        cv2.polylines(canvas, [pts], isClosed=False, color=1, thickness=band_px)
+    return canvas > 0
+
+
+def nearest_label_bev(seed_ids: np.ndarray, grid: BevGrid,
+                      max_dist_m: float | None = None) -> np.ndarray:
+    """(Hb, Wb) int32 seed_ids (0 = no seed) -> every cell labeled with its
+    nearest nonzero seed's id.
+
+    cv2.distanceTransformWithLabels with labelType=DIST_LABEL_PIXEL is
+    documented by OpenCV itself as "a very fast way to compute the Voronoi
+    diagram for a binary image" -- exactly this. It measures distance to ZERO
+    pixels, so the seeds are encoded as the zero set; `labels` then holds, per
+    pixel, an index identifying which zero pixel is nearest. That index is
+    internal to the call, so it is read back at each seed's own position to
+    build an index -> vehicle-id lookup, rather than assumed to match any
+    particular scan order.
+
+    Cells farther than `max_dist_m` from every seed are left at 0 (unattributed)
+    instead of being force-assigned to whichever seed is merely least-far.
+    """
+    seed_ids = np.asarray(seed_ids, dtype=np.int32)
+    seeded = seed_ids != 0
+    if not seeded.any():
+        return np.zeros_like(seed_ids)
+
+    src = np.where(seeded, 0, 255).astype(np.uint8)
+    dist, labels = cv2.distanceTransformWithLabels(
+        src, cv2.DIST_L2, cv2.DIST_MASK_5, labelType=cv2.DIST_LABEL_PIXEL)
+
+    zy, zx = np.nonzero(seeded)
+    lut = np.zeros(int(labels.max()) + 1, np.int32)
+    lut[labels[zy, zx]] = seed_ids[zy, zx]
+    out = lut[labels]
+
+    if max_dist_m is not None:
+        out = np.where(dist <= max_dist_m * grid.ppm, out, 0)
+    return out.astype(np.int32)
+
+
+# --------------------------------------------------------------------------- #
 # How much ground one camera pixel is responsible for
 # --------------------------------------------------------------------------- #
 def ground_m2_per_pixel(H: np.ndarray, grid: BevGrid) -> np.ndarray:

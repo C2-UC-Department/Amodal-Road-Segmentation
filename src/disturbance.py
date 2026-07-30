@@ -12,16 +12,26 @@ measurable: in the image a far-away square metre is a handful of pixels and a
 near one is thousands, whereas every BEV cell is the same size, so counting cells
 is measuring area (src/bev.py).
 
-Per-vehicle attribution is then exact rather than heuristic. An occluded BEV
-cell's source pixel IS the pixel of whatever hides it, so warping the instance-id
-map through the same homography and reading it off identifies the responsible
-vehicle -- no footprint fitting, no nearest-neighbour guessing.
+Per-vehicle attribution is then geometric, not a full-mask warp. The ground-plane
+homography is only valid for pixels that truly lie on the plane; a vehicle's
+roof/hood/windshield do not, and warping them smears its claimed BEV region away
+from the camera past its true position. Only a vehicle's BOTTOM CONTOUR is near
+the plane, so attribution seeds come from that contour alone, projected to BEV
+and rasterised into a small footprint band (src/bev.py), then propagated to the
+rest of its occluded shadow by nearest seed.
+
+Metric scale (camera height) is estimated AUTOMATICALLY by default, from
+detected cars' roof heights above the fitted plane (src/instances.py
+`estimate_camera_height_from_vehicles`) -- no manual input needed. It falls
+back to a fixed assumption only when no car in the scene qualifies. Pass
+--camera-height to override with a known value.
 
 Usage:
     python -m src.disturbance --input data/RealWorld/IMG_0864.jpg
     python -m src.disturbance --input img.jpg --vehicle 2 --json
     python -m src.disturbance --input data/footage_frames --limit 10
     python -m src.disturbance --input img.jpg --no-instance-model    # blobs only
+    python -m src.disturbance --input img.jpg --camera-height 1.4    # known height
 
 For interactive vehicle selection see `streamlit run app.py`.
 """
@@ -53,6 +63,7 @@ COL_VISIBLE = predict.COL_ROAD      # green  -- road the camera can see
 COL_OCCLUDED = predict.COL_PATCH    # cyan   -- road recovered behind occluders
 COL_SELECTED = (255, 0, 200)        # magenta -- the selected vehicle's share
 COL_OBJECT = predict.COL_OBJECT     # red    -- occluder footprints
+COL_FOOTPRINT = (255, 255, 255)     # white  -- each vehicle's own ground-contact band
 
 
 # --------------------------------------------------------------------------- #
@@ -75,6 +86,8 @@ class DisturbanceResult:
     occluded_bev: np.ndarray | None = None
     inst_bev: np.ndarray | None = None
     bev_valid: np.ndarray | None = None
+    footprint_seeds: np.ndarray | None = None  # each vehicle's own ground-contact
+                                                # band, pre-propagation -- for display
 
     total: dict = field(default_factory=dict)
     per_vehicle: dict = field(default_factory=dict)
@@ -137,6 +150,35 @@ def load_models(ckpt: Path | str | None = None, device=None,
 # --------------------------------------------------------------------------- #
 # Steps 3 & 6: compare, then attribute
 # --------------------------------------------------------------------------- #
+def _ground_contact_seed_ids(inst_ids: np.ndarray, vehicles: list, H: np.ndarray,
+                             grid: bev.BevGrid) -> tuple[np.ndarray, list[int]]:
+    """Build the attribution seed image: each vehicle's ground-contact band,
+    projected to BEV and stamped with its id (see the "Ground-contact footprint
+    attribution" section of src/bev.py for why only the contour, not the whole
+    mask, gets projected).
+
+    Vehicles are processed smallest-first, so that on any direct band overlap
+    the larger/more prominent vehicle paints last and wins -- mirroring the
+    ascending-score overlap rule already used in `instances.occluder_instance_ids`.
+
+    Returns (seed_ids, low_coverage_ids) -- the latter lists the ids of vehicles
+    whose ground contact was mostly cropped by the frame (low `coverage_frac`),
+    for a caller warning.
+    """
+    seed_ids = np.zeros(grid.shape, np.int32)
+    low_coverage: list[int] = []
+    for v in sorted(vehicles, key=lambda v: v.pixel_area):
+        pts_uv, coverage = inst.bottom_contour_points(inst_ids == v.inst_id)
+        if coverage < config.FOOTPRINT_MIN_COVERAGE:
+            low_coverage.append(v.inst_id)
+        if len(pts_uv) == 0:
+            continue
+        pts_bev = bev.project_points_to_bev(pts_uv, H, grid)
+        band = bev.rasterize_footprint_band(pts_bev, grid, config.FOOTPRINT_BAND_WIDTH_M)
+        seed_ids[band] = v.inst_id
+    return seed_ids, low_coverage
+
+
 def attribute(occluded_bev: np.ndarray, inst_bev: np.ndarray, vehicles: list,
               grid: bev.BevGrid, scale_factor: float) -> tuple[dict, dict]:
     """Split the occluded BEV area between the instances that hide it.
@@ -163,6 +205,7 @@ def attribute(occluded_bev: np.ndarray, inst_bev: np.ndarray, vehicles: list,
 def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = None,
             threshold: float = 0.5, min_score: float | None = None,
             grid: bev.BevGrid | None = None, use_height_prior: bool = True,
+            auto_camera_height: bool = True,
             max_m2_per_px: float | None = None) -> DisturbanceResult:
     """Full workflow for one image. The CLI and the Streamlit app both call only
     this, so they can never drift apart."""
@@ -216,23 +259,64 @@ def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = N
     implied = bev.implied_camera_height(n_raw)
 
     # --- metric scale (see bev.rescale_plane_to_height) ---
-    target = config.BEV_CAMERA_HEIGHT_M if camera_height_m is None else camera_height_m
     if use_height_prior:
+        est = None
+        if camera_height_m is None and auto_camera_height:
+            # A detected car's ROOF sits a roughly known height above the ground
+            # plane regardless of the car's yaw relative to the camera (unlike
+            # its apparent WIDTH, which is view-angle-dependent), so it is a
+            # per-scene scale anchor that needs no manual input. See
+            # config.VEHICLE_ROOF_HEIGHT_PRIOR_M for validation numbers -- this
+            # is a real improvement over one fixed constant for unknown cameras,
+            # not a precise measurement, hence the sample count/spread reported
+            # alongside it rather than a single silent number.
+            _, h_field, _ = geo.derive_ground_fields(plane["depth"], n_raw, K)
+            est = inst.estimate_camera_height_from_vehicles(h_field, detections, implied)
+
+        if camera_height_m is not None:
+            target, mode = camera_height_m, "manual"
+        elif est is not None:
+            target, mode = est.camera_height_m, "auto_vehicle_height"
+        else:
+            target, mode = config.BEV_CAMERA_HEIGHT_M, "fixed_fallback"
+            if auto_camera_height:
+                warnings.append(
+                    "No car in this scene met the quality bar for automatic "
+                    f"camera-height estimation (need score>={config.SCALE_EST_MIN_SCORE}, "
+                    f">={config.SCALE_EST_MIN_PIXELS}px, an unclipped roofline); "
+                    f"falling back to the fixed {config.BEV_CAMERA_HEIGHT_M:.2f} m "
+                    "assumption. Pass --camera-height if you know this camera's "
+                    "real height.")
+
         n_use, _ = bev.rescale_plane_to_height(n_raw, target)
         # Raw = what the uncorrected plane would have said. A linear world-scale
         # error is a quadratic area error, hence the square.
         scale_factor = (implied / target) ** 2
-        result.scale = {"mode": "camera_height_prior",
+        result.scale = {"mode": mode,
                         "camera_height_m": round(target, 3),
                         "implied_camera_height_m": round(implied, 3),
                         "area_correction": round(1.0 / scale_factor, 5)}
+        if est is not None:
+            result.scale.update(n_samples=est.n_samples, k_spread=round(est.k_spread, 3),
+                                per_vehicle=est.per_vehicle)
+            if est.n_samples == 1:
+                warnings.append(
+                    "Automatic camera-height estimate is based on a single "
+                    "qualifying car -- treat it as a rough estimate, not a "
+                    "precise one. More vehicles in frame (or --camera-height) "
+                    "would tighten it.")
+            elif est.k_spread > 0.3:
+                warnings.append(
+                    f"The {est.n_samples} cars used for automatic camera-height "
+                    f"estimation disagreed substantially (spread {est.k_spread:.0%} "
+                    "of the median) -- the estimate may be unreliable for this scene.")
         if implied / target > 2.0:
             warnings.append(
                 f"Monocular depth implies a camera height of {implied:.2f} m against "
-                f"the assumed {target:.2f} m -- a {implied / target:.1f}x scale error, "
-                f"so uncorrected areas would be {scale_factor:.0f}x too large. "
-                "'area_m2' is corrected; 'area_m2_raw' is not. Set --camera-height "
-                "to this camera's real height.")
+                f"the {'estimated' if mode == 'auto_vehicle_height' else 'assumed'} "
+                f"{target:.2f} m -- a {implied / target:.1f}x scale error, so "
+                f"uncorrected areas would be {scale_factor:.0f}x too large. "
+                "'area_m2' is corrected; 'area_m2_raw' is not.")
     else:
         n_use, scale_factor = n_raw, 1.0
         # The grid is relabelled into the depth model's own (larger) world so that
@@ -279,7 +363,8 @@ def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = N
     result.resolution = res_info
     visible_bev = bev.warp_to_bev(visible, H, grid) & bev_valid
     amodal_bev = bev.warp_to_bev(amodal, H, grid) & bev_valid
-    inst_bev = bev.warp_to_bev(inst_ids, H, grid)
+    seed_ids, low_coverage_ids = _ground_contact_seed_ids(inst_ids, vehicles, H, grid)
+    inst_bev = bev.nearest_label_bev(seed_ids, grid, config.FOOTPRINT_MAX_ATTRIBUTION_DIST_M)
     occluded_bev = amodal_bev & ~visible_bev & bev_valid
     if res_info["measurable_range_m"] < grid.z_max - 1.0:
         warnings.append(
@@ -288,6 +373,11 @@ def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = N
             f"more than {res_info['max_m2_per_px']} m^2 of road and a difference of a "
             "few pixels would swamp the result. Raise --max-m2-per-px to extend the "
             "range at the cost of precision.")
+    if low_coverage_ids:
+        warnings.append(
+            f"Vehicle(s) {', '.join(f'#{i}' for i in low_coverage_ids)} have their "
+            "ground contact mostly cropped by the frame edge, so their footprint "
+            "(and any area attributed to them) may be incomplete.")
 
     # --- step 6: attribute ---
     per_vehicle, unattributed = attribute(occluded_bev, inst_bev, vehicles, grid,
@@ -298,6 +388,7 @@ def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = N
     result.grid, result.H = grid, H          # the grid actually used, post-rescale
     result.visible_bev, result.amodal_bev = visible_bev, amodal_bev
     result.occluded_bev, result.inst_bev, result.bev_valid = occluded_bev, inst_bev, bev_valid
+    result.footprint_seeds = seed_ids
     result.per_vehicle, result.unattributed = per_vehicle, unattributed
     result.total = {
         "amodal_road_m2": round(amodal_area, 3),
@@ -349,6 +440,13 @@ def render_bev(result: DisturbanceResult, selected: int | None = None,
     canvas = common.overlay_mask(canvas, result.bev_valid, (26, 26, 30), 1.0)
     canvas = common.overlay_mask(canvas, result.visible_bev, COL_VISIBLE, 0.75)
     canvas = common.overlay_mask(canvas, result.occluded_bev, COL_OCCLUDED, 0.85)
+    # Every vehicle's own ground-contact band -- the direct visual evidence that
+    # attribution is now anchored to each vehicle's true base rather than a
+    # smeared full-body warp. Drawn BEFORE the selection highlight so the
+    # selected vehicle's own band still reads as selected, not white.
+    if result.footprint_seeds is not None:
+        canvas = common.overlay_mask(canvas, result.footprint_seeds > 0,
+                                     COL_FOOTPRINT, 0.9)
     if selected is not None:
         own = result.occluded_bev & (result.inst_bev == selected)
         canvas = common.overlay_mask(canvas, own, COL_SELECTED, 0.95)
@@ -393,8 +491,16 @@ def _print_report(result: DisturbanceResult, selected: int | None) -> None:
         return
 
     t, s = result.total, result.scale
-    print(f"  scale            {s['mode']}  (implied camera height "
-          f"{s['implied_camera_height_m']:.2f} m)")
+    height_note = f"camera height {s['camera_height_m']:.2f} m"
+    if s["mode"] == "auto_vehicle_height":
+        height_note += (f"  (auto, {s['n_samples']} car(s), "
+                        f"spread {s['k_spread']:.0%})")
+    elif s["mode"] == "fixed_fallback":
+        height_note += "  (no qualifying car -- fixed assumption)"
+    elif s["mode"] == "manual":
+        height_note += "  (manual)"
+    print(f"  scale            {s['mode']:<20} {height_note}")
+    print(f"  implied (biased) {s['implied_camera_height_m']:9.2f} m")
     print(f"  amodal road      {t['amodal_road_m2']:9.2f} m^2")
     print(f"  visible road     {t['visible_road_m2']:9.2f} m^2")
     print(f"  OCCLUDED road    {t['occluded_road_m2']:9.2f} m^2   "
@@ -449,8 +555,15 @@ def main() -> None:
     ap.add_argument("--min-score", type=float, default=None,
                     help=f"instance score threshold (default {config.INSTANCE_MIN_SCORE})")
     ap.add_argument("--camera-height", type=float, default=None,
-                    help=f"true camera height in metres for the metric scale "
-                         f"correction (default {config.BEV_CAMERA_HEIGHT_M})")
+                    help="true camera height in metres for the metric scale "
+                         "correction; overrides automatic estimation. Without "
+                         "this, height is estimated automatically from detected "
+                         f"cars' roof heights, falling back to "
+                         f"{config.BEV_CAMERA_HEIGHT_M} m only when no car qualifies")
+    ap.add_argument("--no-auto-height", action="store_true",
+                    help=f"skip automatic camera-height estimation; use the fixed "
+                         f"{config.BEV_CAMERA_HEIGHT_M} m assumption directly "
+                         "(ignored if --camera-height is set)")
     ap.add_argument("--no-height-prior", action="store_true",
                     help="report only uncorrected areas in the depth model's scale")
     ap.add_argument("--no-instance-model", action="store_true",
@@ -481,6 +594,7 @@ def main() -> None:
         result = analyze(path, models, camera_height_m=args.camera_height,
                          threshold=args.threshold, min_score=args.min_score,
                          grid=grid, use_height_prior=not args.no_height_prior,
+                         auto_camera_height=not args.no_auto_height,
                          max_m2_per_px=args.max_m2_per_px)
         _print_report(result, args.vehicle)
 

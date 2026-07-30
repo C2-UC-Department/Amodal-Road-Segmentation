@@ -51,13 +51,14 @@ def get_models(ckpt: str, use_instance_model: bool):
 
 @st.cache_data(show_spinner="Segmenting, fitting the ground plane, rasterising...")
 def run(_models, image_path: str, ckpt: str, use_instance_model: bool,
-        camera_height: float, use_height_prior: bool, threshold: float,
-        min_score: float, ppm: float, max_m2_per_px: float):
+        camera_height: float | None, use_height_prior: bool, auto_camera_height: bool,
+        threshold: float, min_score: float, ppm: float, max_m2_per_px: float):
     """Cached on every parameter that can change the result, so re-picking a
     vehicle is instant -- selection is a pure read of what this returned."""
     return dist.analyze(Path(image_path), _models,
                         camera_height_m=camera_height,
                         use_height_prior=use_height_prior,
+                        auto_camera_height=auto_camera_height,
                         threshold=threshold, min_score=min_score,
                         grid=bev.BevGrid.from_config(ppm=ppm),
                         max_m2_per_px=max_m2_per_px)
@@ -112,9 +113,21 @@ use_height_prior = st.sidebar.checkbox(
     help="Monocular depth gets absolute scale wrong; the fitted plane exposes the "
          "camera height as 1/||n||, so rescaling to the true height fixes the "
          "whole metric world. A linear scale error is a QUADRATIC area error.")
-camera_height = st.sidebar.number_input(
-    "True camera height (m)", 0.3, 10.0, float(config.BEV_CAMERA_HEIGHT_M), 0.05,
-    disabled=not use_height_prior)
+
+height_mode = st.sidebar.radio(
+    "Camera height source", ["Estimate automatically", "I know the real height"],
+    disabled=not use_height_prior,
+    help="Automatic: estimated per-scene from detected cars' roof heights above "
+         "the ground plane -- no input needed, but not exact (validated to "
+         "roughly ±10-30% against KITTI's known camera height; falls back to a "
+         f"fixed {config.BEV_CAMERA_HEIGHT_M} m assumption when no car in the "
+         "scene qualifies). Manual: exact if you actually know this camera's "
+         "mount height.")
+auto_camera_height = height_mode == "Estimate automatically"
+camera_height = None
+if use_height_prior and not auto_camera_height:
+    camera_height = st.sidebar.number_input(
+        "True camera height (m)", 0.3, 10.0, float(config.BEV_CAMERA_HEIGHT_M), 0.05)
 
 st.sidebar.subheader("Thresholds")
 threshold = st.sidebar.slider("OFRSNet road probability", 0.05, 0.95, 0.5, 0.05)
@@ -155,7 +168,8 @@ Pick an image in the sidebar to start.
 
 models = get_models(ckpt, use_instance_model)
 result = run(models, str(image_path), ckpt, use_instance_model, camera_height,
-             use_height_prior, threshold, min_score, ppm, max_m2_per_px)
+             use_height_prior, auto_camera_height, threshold, min_score, ppm,
+             max_m2_per_px)
 
 st.title(image_path.name)
 for w in result.warnings:
@@ -246,6 +260,7 @@ bev_col, tbl_col = st.columns([2, 3], gap="large")
 with bev_col:
     st.image(dist.render_bev(result, selected),
              caption="BEV · green = visible road · cyan = occluded road · "
+                     "white = each vehicle's ground-contact band · "
                      "magenta = selected vehicle's share",
              width='stretch')
 with tbl_col:
@@ -266,11 +281,15 @@ with tbl_col:
             "uncalibrated m²": result.unattributed["area_m2_raw"], "px": None}],
         hide_index=True, width='stretch')
 
+    sc = result.scale
+    scale_note = f"camera height {sc.get('camera_height_m', '?')} m ({sc['mode']}"
+    if sc["mode"] == "auto_vehicle_height":
+        scale_note += f", {sc['n_samples']} car(s)"
+    scale_note += ")"
     st.caption(
         f"Amodal road {result.total['amodal_road_m2']:.1f} m² · visible "
         f"{result.total['visible_road_m2']:.1f} m² · measured to "
-        f"{result.resolution['measurable_range_m']:.1f} m · implied camera height "
-        f"{result.scale['implied_camera_height_m']:.2f} m")
+        f"{result.resolution['measurable_range_m']:.1f} m · {scale_note}")
 
 with st.expander("What exactly is being measured?"):
     st.markdown(f"""

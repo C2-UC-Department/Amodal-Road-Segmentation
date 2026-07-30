@@ -215,6 +215,143 @@ def test_measurable_mask_excludes_the_unresolved_far_field():
     assert np.all(in_frame[loose])
 
 
+# --------------------------------------------------------------------------- #
+# Automatic camera-height estimation from vehicle roof heights
+# --------------------------------------------------------------------------- #
+H, W = 200, 300
+
+
+def _car_mask(v0, v1, u0=50, u1=150):
+    m = np.zeros((H, W), bool)
+    m[v0:v1, u0:u1] = True
+    return m
+
+
+def _uniform_h(value, mask=None):
+    """h field that is `value` everywhere, or just within `mask` (rest 0)."""
+    h = np.zeros((H, W), np.float32)
+    h[mask if mask is not None else slice(None)] = value
+    return h
+
+
+def test_roofline_height_reads_the_top_slice_only():
+    """A car mask with a roofline value up top and a different value below --
+    the reading must come from the top slice, not be blended with the body."""
+    mask = _car_mask(20, 120)          # 100 rows tall
+    h = np.zeros((H, W), np.float32)
+    h[20:30, 50:150] = -1.5            # roofline: 8-10 rows, per SCALE_EST_TOP_FRAC
+    h[30:120, 50:150] = -0.3           # rest of the body, much lower
+    height, ok = inst._roofline_height_m(h, mask)
+    assert ok
+    assert height == pytest.approx(1.5, abs=0.05)
+
+
+def test_roofline_rejects_mask_touching_image_top():
+    mask = _car_mask(0, 80)            # v0 == 0 -> roofline possibly cut off
+    h = _uniform_h(-1.5, mask)
+    height, ok = inst._roofline_height_m(h, mask)
+    assert not ok and height is None
+
+
+def test_roofline_rejects_degenerate_mask():
+    assert inst._roofline_height_m(np.zeros((H, W), np.float32),
+                                   np.zeros((H, W), bool)) == (None, False)
+
+
+def _det(label="car", score=0.95, v0=20, v1=120, u0=50, u1=150, is_vehicle=True):
+    return inst.Detection(label=label, score=score, mask=_car_mask(v0, v1, u0, u1),
+                          is_vehicle=is_vehicle)
+
+
+def _set_roof(det, h, roof_value_m):
+    """Paint det's mask with a uniform NEGATIVE h (= height above plane)."""
+    h[det.mask] = -roof_value_m
+    return h
+
+
+def test_estimate_returns_none_with_no_qualifying_detection():
+    h = np.zeros((H, W), np.float32)
+    assert inst.estimate_camera_height_from_vehicles(h, [], implied_biased_height=3.0) is None
+    # A detection that fails every filter should also yield None, not crash.
+    bad = _det(label="truck")           # not in VEHICLE_ROOF_HEIGHT_PRIOR_M
+    assert inst.estimate_camera_height_from_vehicles(h, [bad], 3.0) is None
+
+
+def test_estimate_single_vehicle_computes_expected_height():
+    """implied_biased * (prior / roof_biased) is the whole mechanism -- pin it."""
+    d = _det()
+    biased_roof = 2.0
+    prior = config.VEHICLE_ROOF_HEIGHT_PRIOR_M["car"]
+    h = _set_roof(d, np.zeros((H, W), np.float32), biased_roof)
+
+    est = inst.estimate_camera_height_from_vehicles(h, [d], implied_biased_height=3.0)
+    assert est is not None
+    assert est.n_samples == 1
+    assert est.k_median == pytest.approx(prior / biased_roof)
+    assert est.camera_height_m == pytest.approx(3.0 * prior / biased_roof)
+    assert est.k_spread == 0.0          # nothing to disagree with at n=1
+    assert est.per_vehicle[0]["label"] == "car"
+
+
+def test_estimate_combines_multiple_vehicles_by_median():
+    d1 = _det(v0=20, v1=120, u0=20, u1=100)
+    d2 = _det(v0=20, v1=120, u0=150, u1=230)
+    h = np.zeros((H, W), np.float32)
+    _set_roof(d1, h, 1.0)   # k = prior/1.0
+    _set_roof(d2, h, 3.0)   # k = prior/3.0
+
+    prior = config.VEHICLE_ROOF_HEIGHT_PRIOR_M["car"]
+    est = inst.estimate_camera_height_from_vehicles(h, [d1, d2], implied_biased_height=2.0)
+    assert est.n_samples == 2
+    expected_k_med = float(np.median([prior / 1.0, prior / 3.0]))
+    assert est.k_median == pytest.approx(expected_k_med)
+    assert est.camera_height_m == pytest.approx(2.0 * expected_k_med)
+    assert est.k_spread > 0, "two disagreeing vehicles must show a nonzero spread"
+
+
+@pytest.mark.parametrize("mutate,why", [
+    (lambda d: setattr(d, "score", config.SCALE_EST_MIN_SCORE - 0.01), "low score"),
+    (lambda d: setattr(d, "is_vehicle", False), "not a vehicle"),
+    (lambda d: setattr(d, "label", "bus"), "no height prior for this class"),
+])
+def test_estimate_filters_reject_bad_detections(mutate, why):
+    d = _det()
+    h = _set_roof(d, np.zeros((H, W), np.float32), 2.0)
+    mutate(d)
+    assert inst.estimate_camera_height_from_vehicles(h, [d], 3.0) is None, why
+
+
+def test_estimate_rejects_small_and_short_masks():
+    tiny = _det(v0=20, v1=25, u0=50, u1=55)     # well under SCALE_EST_MIN_PIXELS
+    h = _set_roof(tiny, np.zeros((H, W), np.float32), 2.0)
+    assert inst.estimate_camera_height_from_vehicles(h, [tiny], 3.0) is None
+
+    flat = _det(v0=20, v1=20 + config.SCALE_EST_MIN_MASK_ROWS - 1, u0=20, u1=280)
+    h2 = _set_roof(flat, np.zeros((H, W), np.float32), 2.0)
+    assert inst.estimate_camera_height_from_vehicles(h2, [flat], 3.0) is None
+
+
+def test_estimate_rejects_truncated_roofline():
+    d = _det(v0=0, v1=120)      # touches the image's top row
+    h = _set_roof(d, np.zeros((H, W), np.float32), 2.0)
+    assert inst.estimate_camera_height_from_vehicles(h, [d], 3.0) is None
+
+
+def test_estimate_mixes_qualifying_and_disqualifying_detections():
+    """One good car and one bad one -> the good one alone must still produce a
+    result; the bad one must not corrupt or block it."""
+    good = _det(v0=20, v1=120, u0=20, u1=100)
+    bad = _det(v0=20, v1=120, u0=150, u1=230, score=0.1)   # fails score filter
+    h = np.zeros((H, W), np.float32)
+    _set_roof(good, h, 2.0)
+    _set_roof(bad, h, 99.0)     # if this leaked in, k/height would be wildly different
+
+    prior = config.VEHICLE_ROOF_HEIGHT_PRIOR_M["car"]
+    est = inst.estimate_camera_height_from_vehicles(h, [good, bad], implied_biased_height=3.0)
+    assert est.n_samples == 1
+    assert est.camera_height_m == pytest.approx(3.0 * prior / 2.0)
+
+
 def test_ground_resolution_grows_with_range():
     K = np.array([[691.0, 0.0, 360.0], [0.0, 691.0, 640.0], [0.0, 0.0, 1.0]])
     n = np.array([0.0, 1.0 / 1.65, 0.0])
@@ -228,3 +365,112 @@ def test_ground_resolution_grows_with_range():
         at.append(m2px[v, u])
     assert at == sorted(at), "further away must mean coarser"
     assert at[-1] > 100 * at[0], "the decay is steep -- roughly cubic in range"
+
+
+# --------------------------------------------------------------------------- #
+# bottom_contour_points: the ground-contact contour a vehicle mask projects from
+# --------------------------------------------------------------------------- #
+def test_bottom_contour_points_basic_correctness():
+    mask = np.zeros((50, 50), bool)
+    mask[10:30, 5:20] = True                 # rectangle; bottom row is 29
+    pts, coverage = inst.bottom_contour_points(mask)
+
+    assert coverage == pytest.approx(1.0)
+    assert len(pts) == 15                    # columns 5..19
+    assert np.all(pts[:, 1] == 29)           # every point on the true bottom row
+    assert np.array_equal(pts[:, 0], np.sort(pts[:, 0])), "left-to-right by column"
+
+
+def test_bottom_contour_points_ignores_holes_above_the_true_bottom():
+    """A hole/gap above the lowest pixel must not confuse the bottom-row pick."""
+    mask = np.zeros((50, 50), bool)
+    mask[10:15, 5:20] = True                 # roof fragment, disconnected
+    mask[25:30, 5:20] = True                 # body reaching the true bottom (row 29)
+    pts, _ = inst.bottom_contour_points(mask)
+    assert np.all(pts[:, 1] == 29)
+
+
+def test_bottom_contour_points_excludes_frame_truncated_columns():
+    h_img = 50
+    mask = np.zeros((h_img, 50), bool)
+    mask[10:h_img, 5:15] = True              # touches the last row: truncated
+    mask[10:30, 20:30] = True                # a normal, non-truncated column range
+
+    pts, coverage = inst.bottom_contour_points(mask)
+    assert 0.0 < coverage < 1.0
+    assert set(pts[:, 0].tolist()) == set(range(20, 30)), \
+        "only the non-truncated columns should survive"
+    assert np.all(pts[:, 1] == 29)
+
+
+def test_bottom_contour_points_fully_truncated_mask():
+    h_img = 50
+    mask = np.zeros((h_img, 50), bool)
+    mask[10:h_img, 5:20] = True              # every column touches the last row
+    pts, coverage = inst.bottom_contour_points(mask)
+    assert coverage == pytest.approx(0.0)
+    assert len(pts) == 0
+
+
+def test_bottom_contour_points_empty_mask():
+    pts, coverage = inst.bottom_contour_points(np.zeros((50, 50), bool))
+    assert len(pts) == 0 and coverage == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# _ground_contact_seed_ids: contours -> a labeled BEV seed image
+# --------------------------------------------------------------------------- #
+class _Veh:
+    """Minimal stand-in for inst.VehicleInstance (._ground_contact_seed_ids only
+    reads .inst_id and .pixel_area)."""
+
+    def __init__(self, inst_id, pixel_area):
+        self.inst_id = inst_id
+        self.pixel_area = pixel_area
+
+
+def _synthetic_H(grid):
+    K = np.array([[800.0, 0.0, 640.0], [0.0, 800.0, 360.0], [0.0, 0.0, 1.0]])
+    u = np.array([0.0, 1.0, 0.0]) / 1.65
+    return bev.homography_bev_to_image(K, u, grid)
+
+
+def test_ground_contact_seed_ids_stamps_each_vehicle_and_flags_low_coverage():
+    grid = bev.BevGrid.from_config()
+    H = _synthetic_H(grid)
+
+    inst_ids = np.zeros((720, 1280), np.int32)
+    inst_ids[600:650, 300:400] = 1           # a normal, fully-visible base
+    inst_ids[700:720, 800:900] = 2           # base cropped at the image bottom
+
+    vehicles = [_Veh(1, pixel_area=5000), _Veh(2, pixel_area=2000)]
+    seed_ids, low_coverage = dist._ground_contact_seed_ids(inst_ids, vehicles, H, grid)
+
+    assert (seed_ids == 1).any(), "vehicle 1 must get a seed band"
+    assert low_coverage == [2], "vehicle 2's cropped base must be flagged"
+
+
+def test_ground_contact_seed_ids_larger_vehicle_wins_direct_overlap():
+    """Ascending pixel_area order -> the larger vehicle paints last and wins,
+    mirroring occluder_instance_ids' overlap rule."""
+    grid = bev.BevGrid.from_config()
+    H = _synthetic_H(grid)
+
+    inst_ids = np.zeros((720, 1280), np.int32)
+    inst_ids[600:650, 300:340] = 1           # small vehicle
+    inst_ids[600:650, 320:400] = 2           # large vehicle, overlapping columns 320-340
+
+    small_first = [_Veh(1, pixel_area=100), _Veh(2, pixel_area=100000)]
+    seed_ids, _ = dist._ground_contact_seed_ids(inst_ids, small_first, H, grid)
+
+    # Where both vehicles' bands land on the exact same BEV cells, vehicle 2
+    # (processed last, being larger) must be the one that ends up stamped.
+    assert (seed_ids == 2).sum() > (seed_ids == 1).sum()
+
+
+def test_ground_contact_seed_ids_empty_vehicles():
+    grid = bev.BevGrid.from_config()
+    H = _synthetic_H(grid)
+    seed_ids, low_coverage = dist._ground_contact_seed_ids(
+        np.zeros((720, 1280), np.int32), [], H, grid)
+    assert not seed_ids.any() and low_coverage == []

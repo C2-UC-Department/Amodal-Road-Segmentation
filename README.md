@@ -352,13 +352,14 @@ is a handful of pixels and a near one is thousands, whereas every BEV cell is th
 same size, so counting cells *is* measuring area.
 
 ```bash
-# report every occluder
+# report every occluder (camera height estimated automatically)
 python -m src.disturbance --input data/footage_frames/IMG_0040_f00001.jpg --json
 
-# treat instance #2 as the parked vehicle
+# treat instance #2 as the parked vehicle; override with a KNOWN camera height
 python -m src.disturbance --input img.jpg --vehicle 2 --camera-height 1.4
 
 # no extra downloads: split occluders by connected components
+# (also disables automatic height estimation, which needs vehicle instances)
 python -m src.disturbance --input img.jpg --no-instance-model
 
 # interactive selection
@@ -397,14 +398,42 @@ instance/semantic disagreement, and the instance checkpoint is **optional** —
 without it the support is split by connected components, which merges touching
 vehicles but downloads nothing.
 
+### Camera height: estimated automatically, not assumed
+
+A single fixed height assumption is badly wrong for an unknown camera — on our
+own footage the RANSAC-implied height ranges 2.5–7.7 m (median 6.9 m), nothing
+like the true ~1.65 m. So by default **no number is typed in**: a detected car's
+roof sits a roughly known height above the fitted ground plane, regardless of
+the car's yaw relative to the camera (unlike its apparent *width*, which is
+view-angle-dependent and unusable for this), so comparing a car's measured
+roof height (`h` from `derive_ground_fields`, already computed) to a population
+prior (`config.VEHICLE_ROOF_HEIGHT_PRIOR_M`) gives a per-scene correction with
+no manual input.
+
+**Validated against KITTI**, whose true camera height (~1.65 m) is documented
+independently of this pipeline: single-frame estimates were typically within
+±10–30% of ground truth (occasionally worse, and not every frame has a
+qualifying car — 4 of 10 test frames had none), while pooling several
+vehicles/frames converged to within a few percent. That is a real improvement
+over one fixed constant for unknown cameras — **not** a precise measurement.
+The estimate's sample count and inter-vehicle spread are always reported
+alongside it (`n_samples`, `k_spread` in the JSON `scale` block; surfaced as
+warnings when the sample is thin or the vehicles disagree), and it falls back
+to the fixed `BEV_CAMERA_HEIGHT_M` assumption only when no car in the scene
+clears the quality bar (`SCALE_EST_MIN_SCORE`, `SCALE_EST_MIN_PIXELS`, an
+unclipped roofline). `--camera-height <m>` (CLI) or "I know the real height"
+(app) overrides auto-estimation entirely when the true height is actually
+known; `--no-auto-height` skips estimation and uses the fixed assumption
+directly.
+
 ### Reading the numbers honestly
 
 Three figures are always reported together:
 
 | figure | trust |
 |---|---|
-| `occluded_pct` | **highest** — a ratio, so immune to both the depth scale error and the height prior |
-| `area_m2` | corrected via a camera-height prior (`--camera-height`, default 1.65 m) |
+| `occluded_pct` | **highest** — a ratio, so immune to both the depth scale error and the height estimate |
+| `area_m2` | corrected via the estimated (or manually given) camera height |
 | `area_m2_raw` | uncorrected, in the depth model's own scale |
 
 Because the plane fit exposes the camera height directly as `1/‖n‖`, rescaling `n`
