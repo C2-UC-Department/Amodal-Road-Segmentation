@@ -32,6 +32,7 @@ road, so we:
 | 6c | `src/s7_export_geometry.py` | images + semantic maps | `data/processed/geometry/*.npz` (**ground manifold**) |
 | 7  | `src/ofrs/train.py` | semantic + geometry + amodal (KITTI + footage, pooled) | `checkpoints/ofrsnet_best.pt` |
 | 8  | `src/predict.py` | any image folder | predicted amodal road + visualization |
+| 9  | `src/disturbance.py`, `app.py` | any image folder | BEV + per-vehicle parking disturbance (m², %) |
 
 All masks are single-channel **0/255 PNG**, one per image, sharing the source's
 base name (`um_000000.png`, `umm_000012.png`, `uu_000003.png` for KITTI;
@@ -281,24 +282,27 @@ reused — re-run with `--overwrite` to fix.
 
 ### Honest caveats
 
-* **Depth stream only for the normal *magnitude*.** GroundNet's surface-normal
-  stream (Marigold/`diffusers`) is still not installed; gravity now supplies an
-  independent normal *direction*, but not a second depth estimate. Per the
-  paper's ablation (Table 4) depth+RANSAC is the stronger single stream
-  (2.92° vs 6.73° on KITTI), so this captures most of the benefit.
+* **Depth stream only.** GroundNet's surface-normal stream
+  (Marigold/`diffusers`) is not installed, and the plane is fitted by depth
+  RANSAC alone — GeoCalib supplies `K` and nothing else (its predicted gravity is
+  carried on `calibration.Calibration` but deliberately unused, and is not even
+  persisted to the geometry cache). Per the paper's ablation (Table 4)
+  depth+RANSAC is the stronger single stream (2.92° vs 6.73° on KITTI), so this
+  captures most of the benefit.
 * **Monocular depth has a systematic scale error, independent of K.** On KITTI,
   where intrinsics are *exact*, the implied camera height is **2.71 m vs the
   true ~1.65 m** — a ~1.64× overestimate coming from
   Depth-Anything-V2-Metric-Outdoor, not from calibration. This is benign for
   this architecture: a *uniform* scale error rescales `h` and `G` together, and
   the learnable `τ_h` / `τ_d` absorb it exactly, while relative co-planarity
-  (what the gate actually uses) is untouched. It would matter if you consumed
-  these values as true metres — e.g. for a metric BEV — so treat absolute
-  distances as uncalibrated.
-* **Unproven for this task.** The mechanism is verified to behave as designed
-  (see the tests), but whether it *improves road completion* is an open
-  empirical question. Train with `OFRS_USE_GEOMETRY = False` and `True` and
-  compare before trusting it.
+  (what the gate actually uses) is untouched. It **does** matter once you consume
+  these values as true metres — which Step 9 does — so see
+  [Step 9](#step-9--parking-disturbance-bev) for how the scale is corrected there.
+  On our own footage the error is worse than on KITTI: implied camera heights run
+  2.5–7.7 m (median 6.9 m) against a real ~1.65 m.
+* **Unproven for this task.** Whether the geometry stream *improves road
+  completion* is an open empirical question. Train with
+  `OFRS_USE_GEOMETRY = False` and `True` and compare before trusting it.
 
 ## Inference on your own images (Step 8)
 
@@ -329,6 +333,95 @@ patch contribution is highlighted in **cyan** on top of the green final mask.
 Outputs: `data/predictions/<name>_viz.png` (stacked visualization) and
 `data/predictions/mask/<name>.png` (binary amodal road). Accepts png/jpg/bmp/tif
 and recurses into sub-directories.
+
+---
+
+## Step 9 — Parking disturbance (BEV)
+
+Turns the amodal mask into a **number**: how much functional road space a parked
+vehicle takes out of use. Two top-down rasters of the same scene are compared —
+
+| raster | meaning |
+|---|---|
+| **amodal** BEV | the road as it actually is (Mask2Former road + OFRSNet patch) |
+| **visible** BEV | the road as the camera sees it (Mask2Former's `road` class alone) |
+
+— and their difference is road that exists but cannot be used. Rectifying onto the
+ground plane first is what makes this measurable: in the image a far square metre
+is a handful of pixels and a near one is thousands, whereas every BEV cell is the
+same size, so counting cells *is* measuring area.
+
+```bash
+# report every occluder
+python -m src.disturbance --input data/footage_frames/IMG_0040_f00001.jpg --json
+
+# treat instance #2 as the parked vehicle
+python -m src.disturbance --input img.jpg --vehicle 2 --camera-height 1.4
+
+# no extra downloads: split occluders by connected components
+python -m src.disturbance --input img.jpg --no-instance-model
+
+# interactive selection
+streamlit run app.py
+```
+
+Outputs `<out>/<name>_bev.png`, `<out>/<name>_candidates.png` and (with `--json`)
+a full report; default `--out` is `data/disturbance`.
+
+### The homography (`src/bev.py`)
+
+No new geometry is estimated. Step 7 already caches `K` and the ground plane `n`
+in the `n · X = 1` form, and for a ground point `(X, Z)`,
+`Y = (1 − n_x X − n_z Z)/n_y` — **affine** in `(X, Z)`. So the entire image↔BEV
+relation is one 3×3 matrix, `H = K · M(n) · S`, applied with a single
+`cv2.warpPerspective(..., WARP_INVERSE_MAP)`.
+
+`H` is the analytic inverse of `geometry.derive_ground_fields`, which computes the
+same plane's forward ray intersection `G`. The BEV is therefore guaranteed
+consistent with the geometry OFRSNet was trained on, and `tests/test_bev.py`
+asserts the two agree to <0.001 px rather than trusting a fixture.
+
+### Per-vehicle attribution (`src/instances.py`)
+
+Attribution is exact, not heuristic: an occluded BEV cell's source pixel *is* a
+pixel of whatever hides it, so warping the instance-id map through the same
+homography and reading it off identifies the responsible vehicle.
+
+The subtlety is what the ids are defined **on**. `compose_amodal_mask` only
+patches inside `common.occluder_blob_mask(...)`, so the occluded region is
+*defined* by that support. Ids therefore take the support as given and use the
+instance model only to **split** it. Consequences: attribution is complete by
+construction (per-vehicle areas plus the unattributed remainder sum exactly to the
+total, asserted at runtime), the unattributed figure becomes a real diagnostic for
+instance/semantic disagreement, and the instance checkpoint is **optional** —
+without it the support is split by connected components, which merges touching
+vehicles but downloads nothing.
+
+### Reading the numbers honestly
+
+Three figures are always reported together:
+
+| figure | trust |
+|---|---|
+| `occluded_pct` | **highest** — a ratio, so immune to both the depth scale error and the height prior |
+| `area_m2` | corrected via a camera-height prior (`--camera-height`, default 1.65 m) |
+| `area_m2_raw` | uncorrected, in the depth model's own scale |
+
+Because the plane fit exposes the camera height directly as `1/‖n‖`, rescaling `n`
+to a known height fixes the whole metric world — and a *linear* scale error is a
+**quadratic** area error, which is why the two m² figures can differ by ~8×.
+
+Two properties of the measurement are worth stating plainly:
+
+* **It is an occlusion shadow, not a footprint.** A vehicle hides the road
+  *behind* it, so a near-axial view down a street gives a long shadow and an
+  oblique view a short one. It is viewpoint-dependent by construction.
+* **It is range-limited.** Ground resolution decays with roughly the **cube** of
+  distance (a pixel's depth extent goes as `Z²/(f·h)`, its width as `Z/f`), so a
+  couple of pixels of boundary disagreement near the horizon would be worth tens
+  of square metres. Cells whose source pixel covers more than
+  `BEV_MAX_M2_PER_PIXEL` of ground are excluded, and any shadow that reaches that
+  boundary is reported as a **lower bound**.
 
 ---
 

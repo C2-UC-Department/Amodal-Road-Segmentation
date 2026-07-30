@@ -81,33 +81,20 @@ def compute_geometry(rgb: np.ndarray, sem: np.ndarray, base: str, device,
                      image_path: Path | None = None):
     """Ground-manifold fields for one image, as model-ready tensors.
 
-    Prefers the Step-7 cache; falls back to computing depth on the fly for
-    images that were never precomputed (e.g. a brand-new photo). Returns None
-    if geometry is unavailable or the plane fit fails -- the model then falls
-    back to semantic-only behaviour for that image.
+    The cache-or-compute decision for the raw (depth, n, K) primitives lives in
+    `geo.resolve_plane`, shared with the BEV path in src/disturbance.py so the
+    two can never disagree about which plane an image has. Returns None if
+    geometry is unavailable or the plane fit fails -- the model then falls back
+    to semantic-only behaviour for that image.
     """
-    fields = geo.load_ground_fields(base, out_hw=sem.shape)
-    if fields is None:
-        h_img, w_img = sem.shape
-        cal = geo.calibrate_sample(image_path, base, w_img, h_img,
-                                   orig_w=rgb.shape[1], orig_h=rgb.shape[0],
-                                   device=device)
-        rgb_small = (rgb if rgb.shape[:2] == sem.shape else
-                     cv2.resize(rgb, (w_img, h_img), interpolation=cv2.INTER_AREA))
-        depth = geo.estimate_depth_metric(rgb_small, device)
-        ground = sem == ROAD_IDX
-        if int(ground.sum()) < config.GEOM_MIN_GROUND_PX:
-            return None
-        n_plane, _ = geo.estimate_ground_plane(depth, ground, cal.K)
-        if n_plane is None:
-            return None
-        G, hh, gvalid = geo.derive_ground_fields(depth, n_plane, cal.K)
-        fields = dict(G=G, h=hh, gvalid=gvalid, valid=True)
-    if not fields["valid"]:
+    plane = geo.resolve_plane(base, sem, rgb=rgb, image_path=image_path,
+                              device=device)
+    if plane is None or not plane["valid"]:
         return None
+    G, hh, gvalid = geo.derive_ground_fields(plane["depth"], plane["n"], plane["K"])
     # Return raw numpy at NATIVE resolution; predict_amodal resizes and pads it
     # through exactly the same path as the semantic map so the two stay aligned.
-    return fields
+    return dict(G=G, h=hh, gvalid=gvalid, valid=True)
 
 
 def _geo_to_tensors(fields, small_hw, padded_hw, device):

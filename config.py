@@ -229,3 +229,60 @@ OFRS_ATTN_DIM = 64             # query/key dim for the non-local block
 OFRS_ATTN_KV_STRIDE = 4        # pool keys/values by this factor (cost: N x N/stride^2)
 OFRS_TAU_H_INIT = 0.5          # metres; manifold-membership softness
 OFRS_TAU_D_INIT = 25.0         # metres^2; ground-plane neighbourhood (~5 m)
+
+# --------------------------------------------------------------------------- #
+# Bird's-eye view & parking disturbance (src/bev.py, src/disturbance.py)
+# --------------------------------------------------------------------------- #
+# The BEV needs no new estimation: the same (K, n) already cached by Step 7
+# defines an exact ground-plane homography, and that homography is the analytic
+# inverse of geometry.derive_ground_fields' ray-plane intersection. So the BEV
+# raster is guaranteed consistent with the geometry OFRSNet was trained on.
+#
+# Grid convention: X is lateral (camera at X=0, +X right), Z is forward. BEV row
+# v=0 is the FAR edge (z_max), so the raster reads like a map with the camera at
+# the bottom.
+BEV_PPM = 20.0                    # BEV pixels per metre -> 5 cm cells
+BEV_RANGE_X_M = (-10.0, 10.0)     # lateral extent
+BEV_RANGE_Z_M = (0.5, 40.0)       # forward extent (z_min > 0: the camera is not on the plane)
+
+# Metric scale prior. The fitted plane gives camera height directly as 1/||n||,
+# but monocular metric depth overestimates it (~2.71 m implied vs ~1.65 m true on
+# KITTI -- see the README caveats), which would inflate any area by that factor
+# SQUARED. Rescaling n to a known camera height corrects the whole metric world
+# and makes BEV_RANGE_* mean actual metres. Areas are always reported both ways.
+BEV_CAMERA_HEIGHT_M = 1.65
+# Reject plainly broken plane fits rather than rasterising garbage.
+BEV_MIN_CAMERA_HEIGHT_M = 0.3
+BEV_MAX_CAMERA_HEIGHT_M = 10.0
+
+# Measurement reliability cap. Ground resolution decays with roughly the CUBE of
+# range, so past some distance one camera pixel is responsible for a large patch
+# of road and a two-pixel mask disagreement becomes tens of square metres. Cells
+# whose source pixel covers more ground than this are in frame but NOT measurable,
+# and are excluded from every area. 0.02 m^2 ~ a 14 cm square, which on our own
+# footage (fx~690, 720x1280) keeps everything inside ~25 m.
+BEV_MAX_M2_PER_PIXEL = 0.02
+
+# Per-vehicle attribution needs INSTANCES, not just the vehicle class. Same
+# Mask2Former family as MODEL_ID, so no new dependency -- but this checkpoint is
+# optional: without it, src/instances.py falls back to connected components of
+# the occluder mask (the abstraction common.occluder_blob_mask already uses).
+INSTANCE_MODEL_ID = "facebook/mask2former-swin-large-cityscapes-instance"
+INSTANCE_MIN_SCORE = 0.5
+# Occluder-support pixels no detection claimed are kept as their own blob
+# instance above this size, and left unattributed below it. Slivers along an
+# instance boundary are disagreement noise, not vehicles.
+INSTANCE_MIN_BLOB_PX = 200
+
+# Cityscapes "thing" classes we offer as selectable parked vehicles. Matched by
+# substring against id2label, exactly like FOREGROUND_KEYWORDS above.
+VEHICLE_INSTANCE_KEYWORDS = [
+    "car",
+    "truck",
+    "bus",
+    "caravan",
+    "trailer",
+    "motorcycle",
+    "bicycle",
+    "train",          # Cityscapes' on-rails class
+]

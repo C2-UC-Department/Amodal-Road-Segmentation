@@ -357,3 +357,54 @@ def load_ground_fields(base: str, out_hw: tuple[int, int] | None = None):
     n = geo["n"] if geo["valid"] else None
     G, h, gvalid = derive_ground_fields(depth, n, K)
     return dict(G=G, h=h, gvalid=gvalid, valid=geo["valid"])
+
+
+def resolve_plane(base: str, sem: np.ndarray, rgb: np.ndarray | None = None,
+                  image_path: Path | None = None, device=None):
+    """The raw primitives (depth, n, K) for one image, at `sem`'s resolution.
+
+    Prefers the Step-7 cache; falls back to computing depth on the fly for images
+    that were never precomputed (a brand-new photo, an uploaded frame). Returns
+    None when no plane is available -- consumers then fall back to semantic-only
+    behaviour (OFRSNet) or report the BEV as unavailable (src/disturbance.py).
+
+    This exists because two different consumers need the same three quantities
+    but derive different things from them: `derive_ground_fields` for the network,
+    and the ground-plane homography for the BEV (see src/bev.py). Keeping the
+    cache/compute decision in one place means they can never disagree about which
+    plane an image has.
+
+    `sem` is the OFRS semantic map, used both to size the output and (on the
+    compute path) to isolate road pixels for the plane fit.
+    """
+    hgt, wid = sem.shape
+    geo = load_geometry(base)
+    if geo is not None:
+        depth, K = geo["depth"], geo["K"]
+        if depth.shape != (hgt, wid):
+            oh, ow = depth.shape
+            depth = cv2.resize(depth, (wid, hgt), interpolation=cv2.INTER_AREA)
+            K = scale_intrinsics(K, wid / ow, hgt / oh)
+        # NOTE: no GEOM_MIN_GROUND_PX check here. Step 7 already applied it when
+        # building the cache and recorded the outcome in `valid`, so re-testing
+        # against a *different* semantic map would be able to reject a plane the
+        # cache considers good.
+        return dict(depth=depth, n=(geo["n"] if geo["valid"] else None), K=K,
+                    valid=geo["valid"], calibrated=geo["calibrated"],
+                    k_source=geo["k_source"], cached=True)
+
+    if rgb is None:
+        return None
+    cal = calibrate_sample(image_path, base, wid, hgt,
+                           orig_w=rgb.shape[1], orig_h=rgb.shape[0], device=device)
+    rgb_small = (rgb if rgb.shape[:2] == (hgt, wid) else
+                 cv2.resize(rgb, (wid, hgt), interpolation=cv2.INTER_AREA))
+    depth = estimate_depth_metric(rgb_small, device)
+    ground = sem == config.OFRS_CLASSES.index("road")
+    if int(ground.sum()) < config.GEOM_MIN_GROUND_PX:
+        return None
+    n_plane, _ = estimate_ground_plane(depth, ground, cal.K)
+    if n_plane is None:
+        return None
+    return dict(depth=depth, n=n_plane, K=cal.K, valid=True,
+                calibrated=cal.calibrated, k_source=cal.source, cached=False)

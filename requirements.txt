@@ -13,6 +13,13 @@ torchvision>=0.17
 transformers>=4.40
 accelerate>=0.29
 
+# Interactive parking-disturbance app (Step 9): `streamlit run app.py`.
+# Pulls in pandas, which src/disturbance.py itself does not need.
+streamlit>=1.36
+
+# Tests (tests/ -- pure numpy, no models or dataset needed)
+pytest>=8.0
+
 # --- Optional: single-image camera calibration -----------------------------
 # GeoCalib (ECCV 2024) estimates focal length AND gravity direction from one
 # image. Without it the pipeline falls back to EXIF and then to a blind FOV
@@ -22,3 +29,9 @@ accelerate>=0.29
 #     pip install "git+https://github.com/cvg/GeoCalib.git"
 # Code Apache-2.0, pretrained weights CC-BY-4.0. Everything degrades
 # gracefully if it is absent (see src/calibration.py).
+
+# --- Optional: click-to-select in the Step 9 app ---------------------------
+# Streamlit cannot report image click coordinates on its own. With this the
+# vehicle can be picked by clicking it; without it the numbered radio list in
+# app.py does the same job, and the app is fully functional either way.
+#     pip install streamlit-image-coordinates
