@@ -91,14 +91,26 @@ def iter_footage_samples() -> Iterator[Sample]:
             yield Sample(base=image_path.stem, image_path=image_path, gt_path=None)
 
 
+def iter_realworld_samples() -> Iterator[Sample]:
+    """Yield every photo under config.REALWORLD_DIR. No ground truth, same as
+    footage frames -- these are your own real-world photos, not KITTI."""
+    if not config.REALWORLD_DIR.exists():
+        raise FileNotFoundError(f"No real-world photos at {config.REALWORLD_DIR}.")
+    for image_path in sorted(config.REALWORLD_DIR.rglob("*")):
+        if image_path.suffix.lower() in IMAGE_EXTS:
+            yield Sample(base=image_path.stem, image_path=image_path, gt_path=None)
+
+
 def iter_source_samples(source: str) -> Iterator[Sample]:
     """Dispatch to the right sample iterator by source name."""
     if source == "kitti":
         yield from iter_samples(config.SPLIT)
     elif source == "footage":
         yield from iter_footage_samples()
+    elif source == "realworld":
+        yield from iter_realworld_samples()
     else:
-        raise ValueError(f"unknown source {source!r} (expected 'kitti' or 'footage')")
+        raise ValueError(f"unknown source {source!r} (expected 'kitti', 'footage', or 'realworld')")
 
 
 # --------------------------------------------------------------------------- #

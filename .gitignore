@@ -3,3 +3,35 @@ data
 __pycache__
 .DS_Store
 paper
+.build
+
+# Core ML model fixtures: keep the small ones (OFRSNet ~4MB, mobile semantic
+# student ~6.3MB) tracked as test resources; regenerate anything larger
+# (Depth-Anything-V2, ~47MB) locally via tools/coreml_export_depth.py rather
+# than committing it.
+ios/AmodalRoadKit/Tests/AmodalRoadKitTests/Resources/*.mlpackage
+!ios/AmodalRoadKit/Tests/AmodalRoadKitTests/Resources/OFRSNetExport.mlpackage
+!ios/AmodalRoadKit/Tests/AmodalRoadKitTests/Resources/MobileSemanticNet.mlpackage
+
+# Same policy for the models actually bundled into the app target (Xcode
+# auto-compiles every .mlpackage under Models/ to .mlmodelc and copies it
+# into the built app -- see ContentView.swift/ModelBundle.swift): small ones
+# tracked, Depth-Anything-V2 regenerated locally.
+# Dev-only sample photo for exercising the real photo -> semantic overlay
+# pipeline without needing to script the system PhotosPicker UI (see
+# PhotoSemanticView.swift's DebugView "Load bundled test photo" path) --
+# copied from data/RealWorld (already gitignored there), not meant to be
+# committed just because it's now also referenced from inside ios/.
+ios/Parking\ Disturbance/Parking\ Disturbance/SampleData/
+
+ios/Parking\ Disturbance/Parking\ Disturbance/Models/*.mlpackage
+!ios/Parking\ Disturbance/Parking\ Disturbance/Models/OFRSNetExport.mlpackage
+!ios/Parking\ Disturbance/Parking\ Disturbance/Models/MobileSemanticNet.mlpackage
+!ios/Parking\ Disturbance/Parking\ Disturbance/Models/VehicleInstanceYOLO.mlpackage
+
+# Pretrained-weight downloads and ad-hoc Core ML export outputs that land in
+# the repo root by tool default (tools/coreml_export_*.py's --out default,
+# ultralytics' default download location for e.g. yolov8n-seg.pt) -- distinct
+# from checkpoints/*.pt, this project's own trained models, which ARE tracked.
+/*.pt
+/*.mlpackage

@@ -35,3 +35,21 @@ pytest>=8.0
 # vehicle can be picked by clicking it; without it the numbered radio list in
 # app.py does the same job, and the app is fully functional either way.
 #     pip install streamlit-image-coordinates
+
+# iOS migration tooling (tools/coreml_export_ofrsnet.py, src/ofrs/export.py).
+# Like streamlit above, only used by that tool, not imported by the core
+# training/inference pipeline (predict.py, disturbance.py). Not tested past
+# torch 2.7 as of coremltools 9.0 -- this repo runs torch 2.13, which works
+# for OFRSNet's conversion (verified) but should be re-checked after a torch
+# upgrade.
+coremltools>=9.0
+
+# iOS migration tooling (src/mobile_instance/, tools/coreml_export_mobile_instance.py):
+# YOLOv8-seg as the vehicle-instance student -- small, well-precedented Core
+# ML export via Ultralytics' own `model.export(format="coreml")`.
+# LICENSE NOTE: Ultralytics is AGPL-3.0, not permissive -- shipping an app
+# built on it (rather than Ultralytics' paid enterprise license) means the
+# AGPL copyleft terms apply to the app. Confirmed acceptable for this
+# project's current research-only scope; revisit before any commercial
+# release, or swap for a permissively-licensed detector at that point.
+ultralytics>=8.0

@@ -76,8 +76,9 @@ def report_mapping(id2label: dict[int, str], lut: np.ndarray) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", choices=["kitti", "footage"], default="kitti",
-                    help="kitti = data_road images; footage = data/footage_frames")
+    ap.add_argument("--source", choices=["kitti", "footage", "realworld"], default="kitti",
+                    help="kitti = data_road images; footage = data/footage_frames; "
+                         "realworld = data/RealWorld")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--overwrite", action="store_true")

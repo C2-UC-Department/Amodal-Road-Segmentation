@@ -31,6 +31,19 @@ AMODAL_DIR = DATA_DIR / "amodal_road"
 FOOTAGE_DIR = DATA_DIR / "footage"
 FRAMES_DIR = DATA_DIR / "footage_frames"
 
+# A small set of your own real-world photos (not video frames) -- used as a
+# third distillation source alongside kitti/footage. Stands in for
+# Cityscapes/Mapillary Vistas, which need a registered account + license
+# click-through neither of us can automate; see the iOS migration plan's
+# Phase 2 notes for why.
+REALWORLD_DIR = DATA_DIR / "RealWorld"
+
+# Vehicle-instance distillation dataset (YOLO-seg format: images/<split>,
+# labels/<split>, data.yaml) -- src/mobile_instance/, tools/export_yolo_instance_dataset.py
+YOLO_INSTANCE_DIR = PROC_DIR / "yolo_instance"
+MOBILE_INST_VAL_FRACTION = 0.15
+MOBILE_INST_SPLIT_SEED = 777
+
 # OFRSNet training artefacts
 CKPT_DIR = ROOT / "checkpoints"
 
@@ -164,6 +177,40 @@ OFRS_SPLIT_SEED = 1234
 OFRS_EPOCHS = 80
 OFRS_BATCH_SIZE = 4
 OFRS_LR = 1e-3
+
+# --------------------------------------------------------------------------- #
+# Mobile semantic student (iOS migration, Phase 2) -- see src/mobile_semantic/
+# --------------------------------------------------------------------------- #
+# Distills the Mask2Former/Mapillary-Vistas teacher (already run over every
+# source into SEMANTIC_DIR by s5_export_semantics.py) into a small
+# mobile-native backbone: torchvision's LR-ASPP + MobileNetV3-Large, the same
+# "lightweight backbone + Lite R-ASPP decoder" combination the migration
+# plan's Section 1 recommends, with a head replaced for OFRS_NUM_CLASSES.
+# Smaller input than OFRSNet's own OFRS_MAX_SIDE: this network sees full RGB
+# photos (3 channels) rather than a compact one-hot semantic map, so the
+# activation memory per pixel is much higher.
+MOBILE_SEM_MAX_SIDE = 512
+MOBILE_SEM_NET_STRIDE = 32   # MobileNetV3's deepest stride; pad batches to a multiple of this
+
+# Train/val split of every source with a teacher label (deterministic, seeded)
+# -- deliberately separate from OFRS_VAL_FRACTION/OFRS_SPLIT_SEED: this model
+# trains on ALL of SEMANTIC_DIR (540+ samples), not just the smaller
+# hand-annotated amodal subset OFRSNet uses.
+MOBILE_SEM_VAL_FRACTION = 0.15
+MOBILE_SEM_SPLIT_SEED = 4242
+
+# Training hyper-parameters
+MOBILE_SEM_EPOCHS = 30
+MOBILE_SEM_BATCH_SIZE = 4
+MOBILE_SEM_LR = 1e-3
+
+# Auxiliary loss weight: on KITTI samples, which ship a REAL hand-labelled
+# binary road mask (unlike the teacher's own prediction, which is itself
+# just another model's guess), add a BCE term pulling the road channel
+# toward that real annotation. Reflects the plan's asymmetric accuracy bar
+# (Section 1: road/person/vehicle need tight IoU, the other 8 classes can be
+# looser) by giving the one class with real ground truth extra signal.
+MOBILE_SEM_ROAD_AUX_WEIGHT = 1.0
 
 # --------------------------------------------------------------------------- #
 # Geometry stream (GroundNet-derived) -- the "ground manifold" signal
