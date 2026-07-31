@@ -379,6 +379,34 @@ def area_m2(mask: np.ndarray, grid: BevGrid) -> float:
     return float(np.count_nonzero(mask)) * grid.cell_area_m2
 
 
+def row_span_m(mask: np.ndarray, grid: BevGrid) -> np.ndarray:
+    """(Hb,) outer span (rightmost - leftmost True column + 1) of each row, in
+    metres. 0 for an empty row.
+
+    A BEV row is a fixed-distance cross-section of the road, so this is "how
+    wide is the road here" -- tolerant of a small internal gap (noise, a sliver
+    misclassified as non-road), since the reconstructed road is expected to be
+    one contiguous strip and its OUTER extent is the more honest width. Contrast
+    `row_count_m`, which must NOT be gap-tolerant.
+    """
+    h, w = mask.shape
+    cols = np.arange(w)[None, :]
+    rightmost = np.where(mask, cols, -1).max(axis=1)
+    leftmost = np.where(mask, cols, w).min(axis=1)
+    span = np.where(rightmost >= 0, rightmost - leftmost + 1, 0)
+    return span / grid.ppm
+
+
+def row_count_m(mask: np.ndarray, grid: BevGrid) -> np.ndarray:
+    """(Hb,) actually-occupied width of each row, in metres -- a plain count.
+
+    Unlike `row_span_m`, a visible gap between two occluders' shadows within the
+    same row is real, passable road, and must not be counted as blocked just
+    because it sits between two blocked cells.
+    """
+    return mask.sum(axis=1) / grid.ppm
+
+
 # --------------------------------------------------------------------------- #
 # Drawing (grid furniture only; mask compositing lives in src/disturbance.py)
 # --------------------------------------------------------------------------- #

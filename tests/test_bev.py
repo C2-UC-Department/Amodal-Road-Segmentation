@@ -405,3 +405,48 @@ def test_nearest_label_bev_seed_regions_not_just_points():
     out = bev.nearest_label_bev(seed_ids, grid)
     assert out[300, 50] == 1 and out[300, 250] == 2
     assert out[300, 150] in (1, 2)   # midpoint must resolve to one side or the other
+
+
+# --------------------------------------------------------------------------- #
+# Road-width disturbance: row-wise span vs count
+# --------------------------------------------------------------------------- #
+def test_row_span_m_includes_internal_gaps():
+    """A gap (noise, a misclassified sliver) must not shrink the road's outer
+    extent -- span measures the OUTER boundary, not the occupied pixels."""
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    mask = np.zeros(grid.shape, bool)
+    mask[5, 2:5] = True             # cols 2,3,4: span 3, count 3
+    mask[5, 7:9] = True             # cols 7,8:   span extends to col 8
+
+    span = bev.row_span_m(mask, grid)
+    count = bev.row_count_m(mask, grid)
+    assert span[5] == pytest.approx((8 - 2 + 1) / grid.ppm)
+    assert count[5] == pytest.approx(5 / grid.ppm)
+    assert span[5] > count[5], "the gap must inflate span relative to count"
+
+
+def test_row_span_and_count_agree_with_no_gap():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    mask = np.zeros(grid.shape, bool)
+    mask[5, 10:20] = True
+    span = bev.row_span_m(mask, grid)
+    count = bev.row_count_m(mask, grid)
+    assert span[5] == pytest.approx(count[5]) == pytest.approx(10 / grid.ppm)
+
+
+def test_row_span_and_count_empty_row_is_zero():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    mask = np.zeros(grid.shape, bool)
+    span = bev.row_span_m(mask, grid)
+    count = bev.row_count_m(mask, grid)
+    assert not span.any() and not count.any()
+    assert span.shape == (grid.height,) and count.shape == (grid.height,)
+
+
+def test_row_span_and_count_full_row():
+    grid = bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+    mask = np.ones(grid.shape, bool)
+    span = bev.row_span_m(mask, grid)
+    count = bev.row_count_m(mask, grid)
+    expected = grid.width / grid.ppm
+    assert np.allclose(span, expected) and np.allclose(count, expected)

@@ -323,6 +323,23 @@ FOOTPRINT_MIN_COVERAGE = 0.5        # below this fraction of non-truncated conto
                                      # incomplete (its base is mostly cropped by
                                      # the frame) -- surfaced as a warning.
 
+# --------------------------------------------------------------------------- #
+# Road-width disturbance (src/bev.py, src/disturbance.py)
+# --------------------------------------------------------------------------- #
+# Area alone conflates two very different situations: a small occluded patch on
+# a wide road, and a full-width blockage on a narrow one -- only the second one
+# actually stops other traffic passing. A BEV row is a fixed-distance
+# cross-section of the road, so reducing amodal_bev/occluded_bev row-by-row
+# gives "what fraction of the road's WIDTH is blocked here" for free, no new
+# segmentation or geometry needed. Validated on real KITTI and footage scenes
+# (see the "Road-Width Disturbance Metric" design note): per-vehicle figures of
+# 9-38%, a worst-case combined total of 69%, nothing pathological or over 100%.
+#
+# Rows narrower than this are excluded from width stats entirely -- the BEV
+# wedge narrows near the camera (see bev.bev_validity), so a very thin span near
+# the edge of measurement is boundary noise, not a real usable road width.
+WIDTH_MIN_ROAD_SPAN_M = 1.0
+
 # Measurement reliability cap. Ground resolution decays with roughly the CUBE of
 # range, so past some distance one camera pixel is responsible for a large patch
 # of road and a two-pixel mask disagreement becomes tens of square metres. Cells

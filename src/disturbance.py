@@ -199,6 +199,49 @@ def attribute(occluded_bev: np.ndarray, inst_bev: np.ndarray, vehicles: list,
     return per_vehicle, unattributed
 
 
+def width_disturbance(amodal_bev: np.ndarray, occluded_bev: np.ndarray,
+                      inst_bev: np.ndarray, vehicles: list,
+                      grid: bev.BevGrid) -> tuple[dict, dict]:
+    """At each along-road position (a BEV row), what fraction of the road's
+    CROSS-SECTION is blocked -- distinct from area on purpose: a small occluded
+    patch on a wide road and a full-width blockage on a narrow one can have the
+    same area but very different real-world consequences (only the second one
+    actually stops other traffic passing).
+
+    Road width per row is the OUTER SPAN of `amodal_bev` (tolerant of a small
+    internal gap); blocked width is a plain COUNT of `occluded_bev` (a visible
+    gap between two occluders in the same row is real, passable road and must
+    not be swept into "blocked"). See `bev.row_span_m` / `bev.row_count_m`.
+
+    Rows narrower than config.WIDTH_MIN_ROAD_SPAN_M are excluded -- the BEV
+    wedge narrows near the camera, so a very thin span there is measurement
+    boundary noise, not a real usable road width.
+    """
+    road_span = bev.row_span_m(amodal_bev, grid)
+    usable = road_span >= config.WIDTH_MIN_ROAD_SPAN_M
+    z_of_row = grid.z_max - (np.arange(grid.height) + 0.5) / grid.ppm
+
+    def measure(mask):
+        blocked = bev.row_count_m(mask, grid)
+        rows = np.nonzero(usable & (blocked > 0))[0]
+        if len(rows) == 0:
+            return {"width_max_pct": 0.0, "width_mean_pct": 0.0,
+                    "width_max_m": 0.0, "width_road_m_at_max": 0.0,
+                    "width_max_at_z_m": None}
+        frac = blocked[rows] / road_span[rows]
+        row = rows[np.argmax(frac)]
+        return {"width_max_pct": round(100.0 * float(frac.max()), 2),
+                "width_mean_pct": round(100.0 * float(frac.mean()), 2),
+                "width_max_m": round(float(blocked[row]), 3),
+                "width_road_m_at_max": round(float(road_span[row]), 3),
+                "width_max_at_z_m": round(float(z_of_row[row]), 2)}
+
+    per_vehicle = {v.inst_id: measure(occluded_bev & (inst_bev == v.inst_id))
+                  for v in vehicles}
+    total = measure(occluded_bev)
+    return per_vehicle, total
+
+
 # --------------------------------------------------------------------------- #
 # The pipeline
 # --------------------------------------------------------------------------- #
@@ -383,6 +426,15 @@ def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = N
     per_vehicle, unattributed = attribute(occluded_bev, inst_bev, vehicles, grid,
                                           scale_factor)
 
+    # Area alone conflates a small patch on a wide road with a full-width
+    # blockage on a narrow one -- this is the same per_vehicle/total split as
+    # attribute(), but measuring what fraction of the road's WIDTH is blocked
+    # at each vehicle's own worst along-road position, not its area.
+    width_per_vehicle, width_total = width_disturbance(amodal_bev, occluded_bev,
+                                                       inst_bev, vehicles, grid)
+    for vid, w in width_per_vehicle.items():
+        per_vehicle[vid].update(w)
+
     amodal_area = bev.area_m2(amodal_bev, grid)
     occluded_area = bev.area_m2(occluded_bev, grid)
     result.grid, result.H = grid, H          # the grid actually used, post-rescale
@@ -398,6 +450,7 @@ def analyze(image_path: Path, models: dict, *, camera_height_m: float | None = N
         # Scale-immune, and therefore the figure to trust.
         "occluded_pct": (round(100.0 * occluded_area / amodal_area, 2)
                          if amodal_area > 0 else 0.0),
+        **width_total,
     }
 
     # An occluder hides the road BEHIND it all the way to the horizon, so when the
@@ -507,11 +560,15 @@ def _print_report(result: DisturbanceResult, selected: int | None) -> None:
           f"({t['occluded_pct']:.2f}% of amodal road)")
     print(f"    uncalibrated   {t['occluded_road_m2_raw']:9.2f} m^2   "
           "<- monocular depth scale, do not trust absolutely")
+    if t["width_max_at_z_m"] is not None:
+        print(f"  max width blocked{t['width_max_pct']:8.2f} %   "
+              f"({t['width_max_m']:.2f} / {t['width_road_m_at_max']:.2f} m "
+              f"at {t['width_max_at_z_m']:.1f} m out)")
     r = result.resolution
     print(f"  measured to      {r['measurable_range_m']:.1f} m  "
           f"({r['measurable_pct']:.1f}% of grid; {r['in_frame_pct']:.1f}% in frame)")
     print(f"  {'id':>3}  {'label':<12} {'score':>6} {'src':<9} "
-          f"{'area m^2':>9} {'raw m^2':>9}  sel")
+          f"{'area m^2':>9} {'raw m^2':>9} {'max w%':>7}  sel")
     # Ids stay area-of-pixels ordered so `--vehicle N` is stable, but the table
     # reads by how much road each one actually costs. Occluders hiding no
     # measurable road are counted, not listed -- a scene can have dozens.
@@ -526,7 +583,8 @@ def _print_report(result: DisturbanceResult, selected: int | None) -> None:
         star = " <-- selected" if v.inst_id == selected else ""
         score = "  n/a" if np.isnan(v.score) else f"{v.score:.3f}"
         print(f"  {v.inst_id:>3}  {v.label:<12} {score:>6} {v.source:<9} "
-              f"{m.get('area_m2', 0):9.2f} {m.get('area_m2_raw', 0):9.2f}  "
+              f"{m.get('area_m2', 0):9.2f} {m.get('area_m2_raw', 0):9.2f} "
+              f"{m.get('width_max_pct', 0):7.1f}  "
               f"{'y' if v.selectable else '-'}{star}")
     if n_zero:
         print(f"  {'':>3}  ... and {n_zero} more occluder(s) hiding no measurable road")

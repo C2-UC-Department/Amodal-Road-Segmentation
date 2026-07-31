@@ -474,3 +474,130 @@ def test_ground_contact_seed_ids_empty_vehicles():
     seed_ids, low_coverage = dist._ground_contact_seed_ids(
         np.zeros((720, 1280), np.int32), [], H, grid)
     assert not seed_ids.any() and low_coverage == []
+
+
+# --------------------------------------------------------------------------- #
+# width_disturbance: functional ROAD-WIDTH blockage, distinct from area
+# --------------------------------------------------------------------------- #
+def _width_grid():
+    return bev.BevGrid(ppm=20.0, x_min=-10.0, x_max=10.0, z_min=0.5, z_max=40.0)
+
+
+def test_width_disturbance_basic_correctness():
+    grid = _width_grid()
+    amodal_bev = np.zeros(grid.shape, bool)
+    occluded_bev = np.zeros(grid.shape, bool)
+    inst_bev = np.zeros(grid.shape, np.int32)
+
+    row = 300
+    amodal_bev[row, 100:200] = True             # 100 cells = 5.0 m road width
+    occluded_bev[row, 100:130] = True           # 30 cells = 1.5 m blocked
+    inst_bev[row, 100:130] = 1
+
+    per_vehicle, total = dist.width_disturbance(amodal_bev, occluded_bev, inst_bev,
+                                                [_V(1)], grid)
+
+    expected_pct = 100.0 * (30 / 100)
+    assert per_vehicle[1]["width_max_pct"] == pytest.approx(expected_pct)
+    assert per_vehicle[1]["width_mean_pct"] == pytest.approx(expected_pct)
+    assert per_vehicle[1]["width_max_m"] == pytest.approx(30 / grid.ppm)
+    assert per_vehicle[1]["width_road_m_at_max"] == pytest.approx(100 / grid.ppm)
+    assert total["width_max_pct"] == pytest.approx(expected_pct)
+
+    expected_z = grid.z_max - (row + 0.5) / grid.ppm
+    assert per_vehicle[1]["width_max_at_z_m"] == pytest.approx(expected_z, abs=0.01)
+
+
+def test_width_disturbance_max_picks_the_worst_row_mean_averages():
+    grid = _width_grid()
+    amodal_bev = np.zeros(grid.shape, bool)
+    occluded_bev = np.zeros(grid.shape, bool)
+    inst_bev = np.zeros(grid.shape, np.int32)
+
+    amodal_bev[300, 100:200] = True    # 5.0 m road
+    occluded_bev[300, 100:110] = True  # 10% blocked
+    inst_bev[300, 100:110] = 1
+
+    amodal_bev[350, 100:200] = True    # same 5.0 m road, worse blockage
+    occluded_bev[350, 100:180] = True  # 80% blocked
+    inst_bev[350, 100:180] = 1
+
+    per_vehicle, total = dist.width_disturbance(amodal_bev, occluded_bev, inst_bev,
+                                                [_V(1)], grid)
+    assert per_vehicle[1]["width_max_pct"] == pytest.approx(80.0)
+    assert per_vehicle[1]["width_mean_pct"] == pytest.approx((10.0 + 80.0) / 2)
+    assert total["width_max_pct"] == pytest.approx(80.0)
+
+
+def test_width_disturbance_excludes_narrow_rows():
+    """A road span under WIDTH_MIN_ROAD_SPAN_M is measurement-boundary noise,
+    not a real usable width, and must not contribute at all."""
+    grid = _width_grid()
+    amodal_bev = np.zeros(grid.shape, bool)
+    occluded_bev = np.zeros(grid.shape, bool)
+    inst_bev = np.zeros(grid.shape, np.int32)
+
+    narrow_cells = int(config.WIDTH_MIN_ROAD_SPAN_M * grid.ppm) - 1
+    amodal_bev[300, 100:100 + narrow_cells] = True      # too narrow to count
+    occluded_bev[300, 100:100 + narrow_cells] = True    # "fully" blocked, but excluded
+    inst_bev[300, 100:100 + narrow_cells] = 1
+
+    per_vehicle, total = dist.width_disturbance(amodal_bev, occluded_bev, inst_bev,
+                                                [_V(1)], grid)
+    assert per_vehicle[1]["width_max_pct"] == 0.0
+    assert per_vehicle[1]["width_max_at_z_m"] is None
+    assert total["width_max_pct"] == 0.0
+
+
+def test_width_disturbance_vehicle_with_no_occlusion_is_zero_not_nan():
+    grid = _width_grid()
+    amodal_bev = np.zeros(grid.shape, bool)
+    amodal_bev[300, 100:200] = True
+    occluded_bev = np.zeros(grid.shape, bool)          # nothing occluded anywhere
+    inst_bev = np.zeros(grid.shape, np.int32)
+
+    per_vehicle, total = dist.width_disturbance(amodal_bev, occluded_bev, inst_bev,
+                                                [_V(1)], grid)
+    assert per_vehicle[1] == {"width_max_pct": 0.0, "width_mean_pct": 0.0,
+                              "width_max_m": 0.0, "width_road_m_at_max": 0.0,
+                              "width_max_at_z_m": None}
+    assert total["width_max_pct"] == 0.0
+
+
+def test_width_disturbance_never_exceeds_100_percent():
+    """occluded_bev is a subset of amodal_bev by construction elsewhere in the
+    pipeline (disturbance.py: occluded = amodal & ~visible), so blocked can never
+    exceed road width when that invariant holds -- confirm the metric reflects it
+    rather than silently clipping a bug."""
+    grid = _width_grid()
+    amodal_bev = np.zeros(grid.shape, bool)
+    occluded_bev = np.zeros(grid.shape, bool)
+    inst_bev = np.zeros(grid.shape, np.int32)
+
+    amodal_bev[300, 100:200] = True
+    occluded_bev[300, 100:200] = True     # the entire road width, fully blocked
+    inst_bev[300, 100:200] = 1
+
+    per_vehicle, total = dist.width_disturbance(amodal_bev, occluded_bev, inst_bev,
+                                                [_V(1)], grid)
+    assert per_vehicle[1]["width_max_pct"] == pytest.approx(100.0)
+    assert total["width_max_pct"] == pytest.approx(100.0)
+
+
+def test_width_disturbance_multiple_vehicles_share_a_row_independently():
+    grid = _width_grid()
+    amodal_bev = np.zeros(grid.shape, bool)
+    occluded_bev = np.zeros(grid.shape, bool)
+    inst_bev = np.zeros(grid.shape, np.int32)
+
+    amodal_bev[300, 0:200] = True                     # 10.0 m road
+    occluded_bev[300, 0:20] = True; inst_bev[300, 0:20] = 1     # vehicle 1: 1.0 m
+    occluded_bev[300, 100:160] = True; inst_bev[300, 100:160] = 2  # vehicle 2: 3.0 m
+
+    per_vehicle, total = dist.width_disturbance(amodal_bev, occluded_bev, inst_bev,
+                                                [_V(1), _V(2)], grid)
+    assert per_vehicle[1]["width_max_pct"] == pytest.approx(100.0 * 20 / 200)
+    assert per_vehicle[2]["width_max_pct"] == pytest.approx(100.0 * 60 / 200)
+    # Total combines BOTH vehicles' contributions in that row -- must not equal
+    # either vehicle's own figure alone.
+    assert total["width_max_pct"] == pytest.approx(100.0 * 80 / 200)

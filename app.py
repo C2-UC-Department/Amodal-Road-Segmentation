@@ -242,7 +242,7 @@ st.subheader("2 · Measured disturbance")
 sel = next((v for v in result.vehicles if v.inst_id == selected), None)
 own = result.per_vehicle.get(selected, {}) if sel else {}
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric(f"#{selected} occluded road" if sel else "Selected",
           f"{own.get('area_m2', 0):.2f} m²",
           help="Road this vehicle hides, calibrated with the camera-height prior.")
@@ -255,6 +255,11 @@ c4.metric("Uncalibrated", f"{own.get('area_m2_raw', 0):.2f} m²",
           help="Straight from monocular depth's own scale. Shown because the "
                "calibrated figure depends on a camera-height assumption; this one "
                "inherits the depth model's scale error instead.")
+c5.metric("Max width blocked", f"{own.get('width_max_pct', 0):.1f} %",
+          help="Area alone conflates a small patch on a wide road with a "
+               "full-width blockage on a narrow one. This is the fraction of the "
+               "road's WIDTH this vehicle blocks at its single worst "
+               "cross-section, not its total area.")
 
 bev_col, tbl_col = st.columns([2, 3], gap="large")
 with bev_col:
@@ -272,6 +277,7 @@ with tbl_col:
           "source": v.source, "selectable": v.selectable,
           "occluded m²": result.per_vehicle.get(v.inst_id, {}).get("area_m2", 0.0),
           "uncalibrated m²": result.per_vehicle.get(v.inst_id, {}).get("area_m2_raw", 0.0),
+          "max width %": result.per_vehicle.get(v.inst_id, {}).get("width_max_pct", 0.0),
           "px": v.pixel_area}
          for v in sorted(result.vehicles,
                          key=lambda v: -result.per_vehicle.get(v.inst_id, {})
@@ -311,4 +317,11 @@ numbers above:
 
 `occluded_pct` is the most robust figure: it is a ratio, so it survives both the
 monocular depth scale error and the camera-height assumption.
+
+**"Max width blocked" is a different question from area.** A BEV row is a
+fixed-distance cross-section of the road, so at each row this measures what
+fraction of the road's *width* — not its area — is occluded, then reports the
+single worst cross-section. A small patch on a wide road and a full-width
+blockage on a narrow one can have the same area but very different real-world
+consequences: only the second one actually stops other traffic passing.
 """)
