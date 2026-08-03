@@ -11,6 +11,30 @@ func pythonRound(_ x: Double) -> Double {
     x.rounded(.toNearestOrEven)
 }
 
+/// `round(x, 2)` -- Python's real per-decimal-place rounding, which
+/// correctly-rounds the actual binary value directly. Found the hard way
+/// (`BevValidityTests`) that the seemingly-equivalent `pythonRound(x * 100)
+/// / 100` is NOT the same thing: multiplying by 100 first can itself
+/// introduce floating-point error that lands EXACTLY on `.5`, creating an
+/// artificial tie that `.toNearestOrEven` then resolves "correctly" for a
+/// tie that was never really there -- concretely, `26.774999999999998578`
+/// (definitively closer to `26.77`) times 100 rounds to the exact float
+/// `2677.5`, which then ties-to-even up to `2678`, giving the wrong `26.78`.
+/// `String(format: "%.2f", x)` performs the decimal rounding directly on
+/// the binary value (the same class of algorithm CPython's `round()` uses),
+/// without that intermediate multiplication, and was verified to give the
+/// same `26.77` Python does on this exact value.
+func pythonRound2(_ x: Double) -> Double {
+    Double(String(format: "%.2f", x)) ?? x
+}
+
+/// `round(x, 3)` -- same rationale as `pythonRound2`, one more decimal place
+/// (used by `Attribution.attribute`, which mirrors `disturbance.attribute`'s
+/// `round(a, 3)`).
+func pythonRound3(_ x: Double) -> Double {
+    Double(String(format: "%.3f", x)) ?? x
+}
+
 /// A metric top-down raster: `ppm` pixels per metre over `[x, z]` extents.
 ///
 /// Direct port of `bev.BevGrid` in src/bev.py -- see that file for the full

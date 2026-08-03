@@ -114,14 +114,11 @@ struct DebugView: View {
             }
 
             do {
-                let rawModel = try ModelBundle.loadVehicleInstanceRawModel()
-                let desc = rawModel.modelDescription.inputDescriptionsByName["image"]!
-                let ic = desc.imageConstraint!
-                let pixelBuffer = try Self.makePixelBuffer(width: ic.pixelsWide, height: ic.pixelsHigh)
-                let input = try MLDictionaryFeatureProvider(dictionary: ["image": MLFeatureValue(pixelBuffer: pixelBuffer)])
-                let output = try rawModel.prediction(from: input)
-                let names = output.featureNames.sorted()
-                lines.append("VehicleInstanceYOLO: OK, outputs=\(names) (raw, NMS/mask-decode not yet ported to Swift)")
+                let model = try ModelBundle.loadVehicleInstance()
+                let pixelBuffer = try Self.makePixelBuffer(width: model.inputWidth, height: model.inputHeight)
+                let detections = try model.detect(pixelBuffer: pixelBuffer)
+                lines.append("VehicleInstanceYOLO: OK, \(model.inputWidth)x\(model.inputHeight), "
+                    + "\(detections.count) detections on a flat grey synthetic frame (expect 0 -- nothing to detect)")
             } catch {
                 lines.append("VehicleInstanceYOLO: FAILED (\(error))")
             }

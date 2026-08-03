@@ -22,6 +22,30 @@ enum ModelBundleError: Error {
 }
 
 enum ModelBundle {
+    /// `.cpuOnly` for every model, not just the one caught in the act: a
+    /// REAL bug, found by actually looking at output rather than trusting a
+    /// successful build --  `MobileSemanticNet` under default (ANE/GPU-
+    /// eligible) compute-unit dispatch on the iOS SIMULATOR silently
+    /// classified 100% of a real photo as "road" (`DepthAnythingV2Small`
+    /// showed the same symptom, solid-black/degenerate depth), while the
+    /// identical `.mlpackage` gave correct, varied, real output both via
+    /// `swift run` on macOS AND via `.cpuOnly` right here on the Simulator.
+    /// This point at Simulator-specific ANE emulation, not a bug in this
+    /// app's own code (`ImageBytes`/`ImagePreprocessing` were audited and
+    /// are not the cause -- confirmed by this exact fix resolving it with
+    /// no other change). `.cpuOnly` everywhere is the safe default until
+    /// this can be re-tested on a REAL device (not available in this
+    /// environment) -- Simulator's Neural Engine path is documented by
+    /// Apple as an approximation of real ANE hardware, not a guarantee of
+    /// identical numerics, and this is exactly the kind of divergence that
+    /// warning exists for. Trades inference speed for correctness; revisit
+    /// (per-model, not blanket) once real-device testing is possible.
+    private static func cpuOnlyConfiguration() -> MLModelConfiguration {
+        let config = MLModelConfiguration()
+        config.computeUnits = .cpuOnly
+        return config
+    }
+
     static func url(forCompiledModel name: String) throws -> URL {
         guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc") else {
             throw ModelBundleError.resourceNotFound("\(name).mlmodelc")
@@ -30,26 +54,22 @@ enum ModelBundle {
     }
 
     static func loadOFRSNet() throws -> OFRSNetModel {
-        try OFRSNetModel(contentsOf: url(forCompiledModel: "OFRSNetExport"), numClasses: 11)
+        try OFRSNetModel(contentsOf: url(forCompiledModel: "OFRSNetExport"), numClasses: 11,
+                        configuration: cpuOnlyConfiguration())
     }
 
     static func loadDepth() throws -> DepthModel {
-        try DepthModel(contentsOf: url(forCompiledModel: "DepthAnythingV2Small"))
+        try DepthModel(contentsOf: url(forCompiledModel: "DepthAnythingV2Small"),
+                      configuration: cpuOnlyConfiguration())
     }
 
     static func loadMobileSemantic() throws -> MobileSemanticModel {
-        try MobileSemanticModel(contentsOf: url(forCompiledModel: "MobileSemanticNet"))
+        try MobileSemanticModel(contentsOf: url(forCompiledModel: "MobileSemanticNet"),
+                               configuration: cpuOnlyConfiguration())
     }
 
-    /// Vehicle-instance YOLOv8n-seg. No AmodalRoadKit wrapper exists yet --
-    /// NMS + mask-prototype decode aren't ported to Swift yet (see the
-    /// migration plan's Phase 4 open items) -- so this returns the raw
-    /// `MLModel` rather than a typed wrapper. Callers that just want to
-    /// prove the model loads/runs (this app's current debug screen) can use
-    /// it directly; a real typed wrapper should replace this once the
-    /// postprocessing is written.
-    static func loadVehicleInstanceRawModel() throws -> MLModel {
-        let compiledURL = try url(forCompiledModel: "VehicleInstanceYOLO")
-        return try MLModel(contentsOf: compiledURL)
+    static func loadVehicleInstance() throws -> YOLOInstanceModel {
+        try YOLOInstanceModel(contentsOf: url(forCompiledModel: "VehicleInstanceYOLO"),
+                             configuration: cpuOnlyConfiguration())
     }
 }

@@ -14,25 +14,19 @@ import CoreML
 /// inspecting `.strides` right after allocation, they come back tightly
 /// packed -- so this is specifically an output-reading concern.
 extension MLMultiArray {
-    /// Every element in row-major logical order, respecting this array's
-    /// OWN strides. Only `.float16` is implemented -- the only dtype this
-    /// package's Core ML exports ever use (see DepthModel.swift/
-    /// OFRSNetModel.swift's header notes on why `ct.convert(...,
-    /// convert_to="mlprogram")` defaults to it).
-    func float16ElementsRowMajor() -> [Float] {
-        precondition(dataType == .float16)
+    private func elementsRowMajor<T>(as type: T.Type, load: (UnsafePointer<T>, Int) -> Float) -> [Float] {
         let dims = shape.map { $0.intValue }
         let strd = strides.map { $0.intValue }
         let total = dims.reduce(1, *)
         let bufferElements = zip(dims, strd).map { ($0 - 1) * $1 }.reduce(1, +)
-        let ptr = dataPointer.bindMemory(to: Float16.self, capacity: bufferElements)
+        let ptr = dataPointer.bindMemory(to: T.self, capacity: bufferElements)
 
         var result = [Float](repeating: 0, count: total)
         var idx = [Int](repeating: 0, count: dims.count)
         for flat in 0..<total {
             var offset = 0
             for d in 0..<dims.count { offset += idx[d] * strd[d] }
-            result[flat] = Float(ptr[offset])
+            result[flat] = load(ptr, offset)
 
             var d = dims.count - 1
             while d >= 0 {
@@ -43,5 +37,23 @@ extension MLMultiArray {
             }
         }
         return result
+    }
+
+    /// Every element in row-major logical order, respecting this array's
+    /// OWN strides. `.float16` is what `OFRSNetModel`/`DepthModel`/
+    /// `MobileSemanticModel`'s exports use (`ct.convert(..., convert_to=
+    /// "mlprogram")` defaults to it with no dtype on the `TensorType`s --
+    /// see those files' header notes); `.float32` is what the Ultralytics
+    /// YOLO export uses instead (confirmed by inspecting the compiled
+    /// model's `multiArrayConstraint.dataType` directly, `65568`, not
+    /// assumed) -- so both are real, not a guess either way.
+    func float16ElementsRowMajor() -> [Float] {
+        precondition(dataType == .float16)
+        return elementsRowMajor(as: Float16.self) { ptr, offset in Float(ptr[offset]) }
+    }
+
+    func float32ElementsRowMajor() -> [Float] {
+        precondition(dataType == .float32)
+        return elementsRowMajor(as: Float32.self) { ptr, offset in ptr[offset] }
     }
 }

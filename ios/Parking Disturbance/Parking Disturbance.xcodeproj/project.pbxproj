@@ -6,13 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXFileReference section */
-		4EF6AFB7301C979000929AD3 /* Parking Disturbance.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Parking Disturbance.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-/* End PBXFileReference section */
-
 /* Begin PBXBuildFile section */
 		AAAA1111AAAA1111AAAA1113 /* AmodalRoadKit in Frameworks */ = {isa = PBXBuildFile; productRef = AAAA1111AAAA1111AAAA1112 /* AmodalRoadKit */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		4EF6AFB7301C979000929AD3 /* Parking Disturbance.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Parking Disturbance.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		4EF6AFB9301C979000929AD3 /* Parking Disturbance */ = {
@@ -112,21 +112,6 @@
 			);
 		};
 /* End PBXProject section */
-
-/* Begin XCLocalSwiftPackageReference section */
-		AAAA1111AAAA1111AAAA1111 /* XCLocalSwiftPackageReference "../AmodalRoadKit" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = ../AmodalRoadKit;
-		};
-/* End XCLocalSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		AAAA1111AAAA1111AAAA1112 /* AmodalRoadKit */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = AAAA1111AAAA1111AAAA1111 /* XCLocalSwiftPackageReference "../AmodalRoadKit" */;
-			productName = AmodalRoadKit;
-		};
-/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXResourcesBuildPhase section */
 		4EF6AFB5301C979000929AD3 /* Resources */ = {
@@ -356,6 +341,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		AAAA1111AAAA1111AAAA1111 /* XCLocalSwiftPackageReference "../AmodalRoadKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../AmodalRoadKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AAAA1111AAAA1111AAAA1112 /* AmodalRoadKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AAAA1111AAAA1111AAAA1111 /* XCLocalSwiftPackageReference "../AmodalRoadKit" */;
+			productName = AmodalRoadKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 4EF6AFAF301C979000929AD3 /* Project object */;
 }

@@ -1,0 +1,7 @@
+{
+    "sweetpad.build.destination": {
+        "id": "iossimulator-83DAC569-905C-424C-8C74-7F6BEFE61CAD",
+        "type": "iOSSimulator"
+    },
+    "sweetpad.build.scheme": "Parking Disturbance"
+}
